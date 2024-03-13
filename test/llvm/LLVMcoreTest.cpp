@@ -529,6 +529,7 @@ TEST(AsyncExecute, CustomWasmInterruptTest) {
 
 } // namespace
 
+
 GTEST_API_ int main(int argc, char **argv) {
   WasmEdge::Log::setErrorLoggingLevel();
   testing::InitGoogleTest(&argc, argv);
