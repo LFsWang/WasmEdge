@@ -127,7 +127,7 @@ jobs:
 
       - name: Login to DockerHub
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_ACCESS_TOKEN }}
@@ -135,7 +135,7 @@ jobs:
       # DO NOT skip the whole job to prevent descending jobs to be skipped
       - if: ${{ needs.paths-filter.outputs.ci-image-base == 'true' }}
         name: Bake and Push
-        uses: docker/bake-action@37816e747588cb137173af99ab33873600c46ea8 # v6.8.0
+        uses: docker/bake-action@3acf805d94d93a86cce4ca44798a76464a75b88c # v6.9.0
         with:
           files: utils/docker/docker-bake.ci-image-base.hcl
           push: ${{ github.event_name != 'pull_request' }}
@@ -170,13 +170,13 @@ jobs:
 
       - name: Login to DockerHub
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_ACCESS_TOKEN }}
 
       - name: Bake and Push
-        uses: docker/bake-action@37816e747588cb137173af99ab33873600c46ea8 # v6.8.0
+        uses: docker/bake-action@3acf805d94d93a86cce4ca44798a76464a75b88c # v6.9.0
         with:
           files: utils/docker/docker-bake.ubuntu.hcl
           targets: ${{ matrix.targets }}
@@ -228,13 +228,13 @@ jobs:
 
       - name: Login to DockerHub
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_ACCESS_TOKEN }}
 
       - name: Bake and Push
-        uses: docker/bake-action@37816e747588cb137173af99ab33873600c46ea8 # v6.8.0
+        uses: docker/bake-action@3acf805d94d93a86cce4ca44798a76464a75b88c # v6.9.0
         with:
           files: utils/docker/docker-bake.manylinux.hcl
           targets: ${{ matrix.targets }}
