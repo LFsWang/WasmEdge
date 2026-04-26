@@ -230,6 +230,11 @@ Executor::invoke(const Runtime::Instance::Component::FunctionInstance *FuncInst,
   // TODO: COMPONENT - type matching.
   // const auto &FuncType = FuncInst->getFuncType();
   // const auto PTypes = FuncType.getParamList();
+  const auto &PList = FuncInst->getFuncType().getParamList();
+  if (Params.size() != PList.size() || ParamTypes.size() != PList.size()) {
+    spdlog::error(ErrCode::Value::FuncSigMismatch);
+    return Unexpect(ErrCode::Value::FuncSigMismatch);
+  }
 
   // Convert the component params into core WASM params.
   auto *ReallocFuncInst = FuncInst->getAllocFunction();

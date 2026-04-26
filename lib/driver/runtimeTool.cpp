@@ -44,6 +44,18 @@ bool parseNumericArg(const std::string &Value, size_t ParamIndex,
   }
 }
 
+static int checkArgCount(std::string_view FuncName, size_t Expected,
+                         size_t ProvidedIncludingFuncName) noexcept {
+  const size_t Provided =
+      ProvidedIncludingFuncName == 0 ? 0 : ProvidedIncludingFuncName - 1;
+  if (Provided != Expected) {
+    spdlog::error("function \"{}\" expects {} argument(s), got {}"sv, FuncName,
+                  Expected, Provided);
+    return EXIT_FAILURE;
+  }
+  return EXIT_SUCCESS;
+}
+
 static int
 ToolOnModule(WasmEdge::VM::VM &VM, const std::string &FuncName,
              std::optional<std::chrono::system_clock::time_point> Timeout,
@@ -52,9 +64,12 @@ ToolOnModule(WasmEdge::VM::VM &VM, const std::string &FuncName,
   std::vector<ValVariant> FuncArgs;
   std::vector<ValType> FuncArgTypes;
 
-  for (size_t I = 0;
-       I < FuncType.getParamTypes().size() && I + 1 < Opt.Args.value().size();
-       ++I) {
+  if (checkArgCount(FuncName, FuncType.getParamTypes().size(),
+                    Opt.Args.value().size()) == EXIT_FAILURE) {
+    return EXIT_FAILURE;
+  }
+
+  for (size_t I = 0; I < FuncType.getParamTypes().size(); ++I) {
     const auto TCode = FuncType.getParamTypes()[I].getCode();
     const auto &ArgValue = Opt.Args.value()[I + 1];
 
@@ -102,19 +117,6 @@ ToolOnModule(WasmEdge::VM::VM &VM, const std::string &FuncName,
     // TODO: FuncRef and ExternRef
     default:
       break;
-    }
-  }
-  if (FuncType.getParamTypes().size() + 1 < Opt.Args.value().size()) {
-    for (size_t I = FuncType.getParamTypes().size() + 1;
-         I < Opt.Args.value().size(); ++I) {
-      if (!parseNumericArg(
-              Opt.Args.value()[I], I, "i64"sv,
-              [](const std::string &S) {
-                return static_cast<uint64_t>(std::stoll(S));
-              },
-              FuncArgs, FuncArgTypes, TypeCode::I64)) {
-        return EXIT_FAILURE;
-      }
     }
   }
 
@@ -182,9 +184,12 @@ ToolOnComponent(WasmEdge::VM::VM &VM, const std::string &FuncName,
   std::vector<ComponentValVariant> FuncArgs;
   std::vector<ComponentValType> FuncArgTypes;
 
-  for (size_t I = 0;
-       I < FuncType.getParamList().size() && I + 1 < Opt.Args.value().size();
-       ++I) {
+  if (checkArgCount(FuncName, FuncType.getParamList().size(),
+                    Opt.Args.value().size()) == EXIT_FAILURE) {
+    return EXIT_FAILURE;
+  }
+
+  for (size_t I = 0; I < FuncType.getParamList().size(); ++I) {
     const auto TCode = FuncType.getParamList()[I].getValType().getCode();
     const auto &ArgValue = Opt.Args.value()[I + 1];
 
@@ -260,19 +265,6 @@ ToolOnComponent(WasmEdge::VM::VM &VM, const std::string &FuncName,
     // TODO: COMPONENT - other types.
     default:
       break;
-    }
-  }
-  if (FuncType.getParamList().size() + 1 < Opt.Args.value().size()) {
-    for (size_t I = FuncType.getParamList().size() + 1;
-         I < Opt.Args.value().size(); ++I) {
-      if (!parseNumericArg(
-              Opt.Args.value()[I], I, "u64"sv,
-              [](const std::string &S) {
-                return ValVariant(static_cast<uint64_t>(std::stoll(S)));
-              },
-              FuncArgs, FuncArgTypes, ComponentTypeCode::U64)) {
-        return EXIT_FAILURE;
-      }
     }
   }
 
