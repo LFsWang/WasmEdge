@@ -2953,6 +2953,9 @@ Validator::validate(const AST::Component::ImportDecl &Decl) noexcept {
     return E;
   };
 
+  const uint32_t TypeSpaceBefore =
+      CompCtx.getSortIndexSize(AST::Component::Sort::SortType::Type);
+
   // Validate the extern descriptor (also increments sort index spaces).
   EXPECTED_TRY(validate(Decl.getExternDesc()).map_error(ReportError));
 
@@ -2975,6 +2978,39 @@ Validator::validate(const AST::Component::ImportDecl &Decl) noexcept {
     break;
   default:
     break;
+  }
+
+  // An annotated name must reference a resource in scope (mirrors the concrete
+  // import path so component-type declarations are validated too).
+  std::string_view ResourceLabel;
+  switch (CName.getKind()) {
+  case ComponentNameKind::Constructor:
+    ResourceLabel = CName.getDetail().get<ConstructorDetail>().Label;
+    break;
+  case ComponentNameKind::Method:
+    ResourceLabel = CName.getDetail().get<MethodDetail>().Resource;
+    break;
+  case ComponentNameKind::Static:
+    ResourceLabel = CName.getDetail().get<StaticDetail>().Resource;
+    break;
+  default:
+    break;
+  }
+  if (!ResourceLabel.empty() && !CompCtx.hasResourceLabel(ResourceLabel)) {
+    spdlog::error(ErrCode::Value::ComponentInvalidName);
+    spdlog::error(
+        "    ImportDecl: annotated name references unknown resource '{}'"sv,
+        ResourceLabel);
+    spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Decl_Import));
+    return Unexpect(ErrCode::Value::ComponentInvalidName);
+  }
+
+  // Register a TypeBound resource import's kebab label so later annotated
+  // names in this declaration scope can reference it.
+  if (Decl.getExternDesc().getDescType() ==
+          AST::Component::ExternDesc::DescType::TypeBound &&
+      CName.getKind() == ComponentNameKind::Label) {
+    CompCtx.addResourceLabel(Decl.getName(), TypeSpaceBefore);
   }
 
   // Check import name uniqueness.
