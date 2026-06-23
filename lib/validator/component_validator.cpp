@@ -620,20 +620,84 @@ ownOrBorrowResource(const ComponentContext &Ctx,
   return std::nullopt;
 }
 
-// Resource type indices directly referenced (own/borrow) by a function's
-// parameters and results.
+// Collect every resource type index transitively referenced (own/borrow) by a
+// component value type, descending through compound types (record / tuple /
+// list / option / result / variant) and TypeIndex indirections. Depth-guarded
+// against pathological type graphs.
+void collectDefValTypeResources(const ComponentContext &Ctx,
+                                const AST::Component::DefValType &D,
+                                std::vector<uint32_t> &Out, unsigned Depth);
+
+void collectValTypeResources(const ComponentContext &Ctx,
+                             const ComponentValType &VT,
+                             std::vector<uint32_t> &Out, unsigned Depth) {
+  if (Depth > 32u) {
+    return;
+  }
+  if (VT.getCode() == ComponentTypeCode::Own ||
+      VT.getCode() == ComponentTypeCode::Borrow) {
+    Out.push_back(VT.getTypeIndex());
+    return;
+  }
+  if (VT.getCode() != ComponentTypeCode::TypeIndex) {
+    return;
+  }
+  const auto *DT = Ctx.getDefType(VT.getTypeIndex());
+  if (DT == nullptr || !DT->isDefValType()) {
+    return;
+  }
+  collectDefValTypeResources(Ctx, DT->getDefValType(), Out, Depth + 1);
+}
+
+void collectDefValTypeResources(const ComponentContext &Ctx,
+                                const AST::Component::DefValType &D,
+                                std::vector<uint32_t> &Out, unsigned Depth) {
+  if (Depth > 32u) {
+    return;
+  }
+  if (D.isOwnTy()) {
+    Out.push_back(D.getOwn().Idx);
+  } else if (D.isBorrowTy()) {
+    Out.push_back(D.getBorrow().Idx);
+  } else if (D.isRecordTy()) {
+    for (const auto &F : D.getRecord().LabelTypes) {
+      collectValTypeResources(Ctx, F.getValType(), Out, Depth + 1);
+    }
+  } else if (D.isTupleTy()) {
+    for (const auto &T : D.getTuple().Types) {
+      collectValTypeResources(Ctx, T, Out, Depth + 1);
+    }
+  } else if (D.isListTy()) {
+    collectValTypeResources(Ctx, D.getList().ValTy, Out, Depth + 1);
+  } else if (D.isOptionTy()) {
+    collectValTypeResources(Ctx, D.getOption().ValTy, Out, Depth + 1);
+  } else if (D.isResultTy()) {
+    const auto &R = D.getResult();
+    if (R.ValTy.has_value()) {
+      collectValTypeResources(Ctx, *R.ValTy, Out, Depth + 1);
+    }
+    if (R.ErrTy.has_value()) {
+      collectValTypeResources(Ctx, *R.ErrTy, Out, Depth + 1);
+    }
+  } else if (D.isVariantTy()) {
+    for (const auto &C : D.getVariant().Cases) {
+      if (C.second.has_value()) {
+        collectValTypeResources(Ctx, *C.second, Out, Depth + 1);
+      }
+    }
+  }
+}
+
+// Resource type indices transitively referenced (own/borrow) by a function's
+// parameters and results, including resources nested inside compound types.
 std::vector<uint32_t> funcResourceIndices(const ComponentContext &Ctx,
                                           const AST::Component::FuncType &FT) {
   std::vector<uint32_t> Out;
   for (const auto &P : FT.getParamList()) {
-    if (auto R = ownOrBorrowResource(Ctx, P.getValType())) {
-      Out.push_back(*R);
-    }
+    collectValTypeResources(Ctx, P.getValType(), Out, 0);
   }
   for (const auto &R : FT.getResultList()) {
-    if (auto Ri = ownOrBorrowResource(Ctx, R.getValType())) {
-      Out.push_back(*Ri);
-    }
+    collectValTypeResources(Ctx, R.getValType(), Out, 0);
   }
   return Out;
 }
