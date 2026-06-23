@@ -1684,9 +1684,25 @@ Validator::validate(const AST::Component::Instance &Inst) noexcept {
               }
             }
           }
-          CompCtx.addInstanceExport(
-              InstanceIdx, Exp.getName(), ExpSort.getSortType(), IT,
-              /*NestedInstIdx=*/std::nullopt, ResourceId, ResourceLocal);
+          // An instance-sort export that re-exports an imported instance
+          // carries that argument instance's structure, so a later alias-export
+          // can resolve its nested exports (GAP-I-5b nested instance
+          // forwarding).
+          std::optional<uint32_t> NestedInstIdx;
+          if (ExpSort.getSortType() ==
+              AST::Component::Sort::SortType::Instance) {
+            const auto InstName =
+                childInstanceImportName(*Comp, Exp.getSortIndex().getIdx());
+            if (!InstName.empty()) {
+              auto It = ArgInstanceIdx.find(InstName);
+              if (It != ArgInstanceIdx.end()) {
+                NestedInstIdx = It->second;
+              }
+            }
+          }
+          CompCtx.addInstanceExport(InstanceIdx, Exp.getName(),
+                                    ExpSort.getSortType(), IT, NestedInstIdx,
+                                    ResourceId, ResourceLocal);
         }
       }
     } else if (CompTy != nullptr) {
