@@ -3557,6 +3557,20 @@ Expect<void> Validator::validate(const AST::Component::Export &Ex) noexcept {
         }
       }
     } else if (Sort.getSortType() == AST::Component::Sort::SortType::Func) {
+      // An annotated export ([constructor]/[method]) must additionally have the
+      // shape the annotation requires (return `(own $R)`, `self` as
+      // `(borrow $R)`); the rule applies to exports as well as imports.
+      if (CName.getKind() == ComponentNameKind::Constructor ||
+          CName.getKind() == ComponentNameKind::Method) {
+        if (const auto *FT = CompCtx.getFunc(Idx)) {
+          EXPECTED_TRY(validateAnnotatedFuncSig(CompCtx, CName, *FT)
+                           .map_error([](auto E) {
+                             spdlog::error(
+                                 ErrInfo::InfoAST(ASTNodeAttr::Comp_Export));
+                             return E;
+                           }));
+        }
+      }
       // A function exported from this component must have its resources named
       // in the export context: a plain export may use imported or exported
       // resources but not a locally-defined unexported one; an annotated
@@ -3867,6 +3881,23 @@ Validator::validate(const AST::Component::ImportDecl &Decl) noexcept {
     return Unexpect(ErrCode::Value::ComponentInvalidName);
   }
 
+  // Validate the annotated function's signature against the resource it names
+  // (the rule applies inside component-type / instance-type declarations too).
+  if ((CName.getKind() == ComponentNameKind::Constructor ||
+       CName.getKind() == ComponentNameKind::Method) &&
+      Decl.getExternDesc().getDescType() ==
+          AST::Component::ExternDesc::DescType::FuncType) {
+    const auto *DT = CompCtx.getDefType(Decl.getExternDesc().getTypeIndex());
+    if (DT != nullptr && DT->isFuncType()) {
+      EXPECTED_TRY(validateAnnotatedFuncSig(CompCtx, CName, DT->getFuncType())
+                       .map_error([](auto E) {
+                         spdlog::error(
+                             ErrInfo::InfoAST(ASTNodeAttr::Comp_Decl_Import));
+                         return E;
+                       }));
+    }
+  }
+
   // Register a TypeBound resource import's kebab label so later annotated
   // names in this declaration scope can reference it.
   if (Decl.getExternDesc().getDescType() ==
@@ -3917,6 +3948,23 @@ Validator::validate(const AST::Component::ExportDecl &Decl) noexcept {
     spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Decl_Export));
     return E;
   }));
+
+  // Validate the annotated function's signature shape (return `(own $R)`,
+  // `self` as `(borrow $R)`); the rule applies to exported declarations too.
+  if ((CName.getKind() == ComponentNameKind::Constructor ||
+       CName.getKind() == ComponentNameKind::Method) &&
+      Decl.getExternDesc().getDescType() ==
+          AST::Component::ExternDesc::DescType::FuncType) {
+    const auto *DT = CompCtx.getDefType(Decl.getExternDesc().getTypeIndex());
+    if (DT != nullptr && DT->isFuncType()) {
+      EXPECTED_TRY(validateAnnotatedFuncSig(CompCtx, CName, DT->getFuncType())
+                       .map_error([](auto E) {
+                         spdlog::error(
+                             ErrInfo::InfoAST(ASTNodeAttr::Comp_Decl_Export));
+                         return E;
+                       }));
+    }
+  }
 
   return {};
 }

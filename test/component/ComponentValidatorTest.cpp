@@ -660,9 +660,9 @@ TEST(ComponentValidatorTest, InstanceTypeExportCaseFoldConflict) {
 
 TEST(ComponentValidatorTest, InstanceTypeExportConstructorPlainAllowed) {
   // (type (instance
-  //   (type (func))                         ;; type 0 for the exports below
-  //   (export "foo" (func (type 0)))
-  //   (export "[constructor]foo" (func (type 0)))  ;; OK: strongly-unique pair
+  //   (export "foo" (type (sub resource)))         ;; type 0: resource foo
+  //   (type (func (result (own 0))))               ;; type 1: constructor sig
+  //   (export "[constructor]foo" (func (type 1)))  ;; OK: strongly-unique pair
   // ))
   AST::Component::Component Comp;
   Comp.getSections().emplace_back();
@@ -671,18 +671,29 @@ TEST(ComponentValidatorTest, InstanceTypeExportConstructorPlainAllowed) {
       std::get<AST::Component::TypeSection>(Comp.getSections().back());
 
   std::vector<AST::Component::InstanceDecl> Decls;
-  // Define a FuncType at the instancetype's local type idx 0.
+  // export "foo" (type (sub resource)) -- instancetype-local type idx 0.
+  {
+    AST::Component::ExportDecl Exp;
+    Exp.getName() = "foo";
+    Exp.getExternDesc().setTypeBound();
+    AST::Component::InstanceDecl D;
+    D.setExport(std::move(Exp));
+    Decls.push_back(std::move(D));
+  }
+  // Define the constructor's FuncType `(func (result (own 0)))` at type idx 1.
   {
     auto DT = std::make_unique<AST::Component::DefType>();
-    DT->setFuncType(AST::Component::FuncType{});
+    AST::Component::FuncType FT;
+    FT.setResultList(ComponentValType(ComponentTypeCode::Own, 0));
+    DT->setFuncType(std::move(FT));
     AST::Component::InstanceDecl FtDecl;
     FtDecl.setType(std::move(DT));
     Decls.push_back(std::move(FtDecl));
   }
-  for (const auto *N : {"foo", "[constructor]foo"}) {
+  {
     AST::Component::ExportDecl Exp;
-    Exp.getName() = N;
-    Exp.getExternDesc().setFuncTypeIdx(0);
+    Exp.getName() = "[constructor]foo";
+    Exp.getExternDesc().setFuncTypeIdx(1);
     AST::Component::InstanceDecl D;
     D.setExport(std::move(Exp));
     Decls.push_back(std::move(D));
