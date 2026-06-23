@@ -2074,6 +2074,28 @@ Validator::validate(const AST::Component::Instance &Inst) noexcept {
         spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Instance));
         return Unexpect(ErrCode::Value::InvalidIndex);
       }
+      // An inline-export instance (bag-of-exports) freshens the resources it
+      // exports, so an externally-defined function bundled under an annotated
+      // name ([constructor]/[method]/[static]) cannot name the freshened
+      // resource it uses (resources.wast bag-of-exports validation).
+      if (Sort.getSortType() == AST::Component::Sort::SortType::Func) {
+        if (auto CName = ComponentName::parse(Export.getName())) {
+          const auto K = CName->getKind();
+          if (K == ComponentNameKind::Constructor ||
+              K == ComponentNameKind::Method ||
+              K == ComponentNameKind::Static) {
+            if (const auto *FT = CompCtx.getFunc(Idx);
+                FT != nullptr && !funcResourceIndices(CompCtx, *FT).empty()) {
+              spdlog::error(ErrCode::Value::InvalidTypeReference);
+              spdlog::error("    Instance: function exported by an inline "
+                            "instance references a resource with no name in "
+                            "this context"sv);
+              spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Instance));
+              return Unexpect(ErrCode::Value::InvalidTypeReference);
+            }
+          }
+        }
+      }
       if (Sort.getSortType() == AST::Component::Sort::SortType::Type) {
         auto SubstitutedIdx =
             CompCtx.getSubstitutedType(std::string(Export.getName()));
