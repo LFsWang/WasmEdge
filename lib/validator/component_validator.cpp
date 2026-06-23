@@ -266,6 +266,74 @@ ChildResourceInfo resolveChildResource(const AST::Component::Component &Comp,
   return {};
 }
 
+// Resolve a child component type index to its inline DefType (type-section
+// entries only; imports/aliases have no inline body), mirroring the type index
+// space of resolveChildResource.
+const AST::Component::DefType *
+resolveChildDefType(const AST::Component::Component &Comp, uint32_t TypeIdx) {
+  uint32_t CurrentIdx = 0;
+  for (const auto &Sec : Comp.getSections()) {
+    if (std::holds_alternative<AST::Component::TypeSection>(Sec)) {
+      const auto &TSec = std::get<AST::Component::TypeSection>(Sec);
+      for (const auto &DT : TSec.getContent()) {
+        if (CurrentIdx == TypeIdx) {
+          return &DT;
+        }
+        CurrentIdx++;
+      }
+    } else if (std::holds_alternative<AST::Component::ImportSection>(Sec)) {
+      const auto &ISec = std::get<AST::Component::ImportSection>(Sec);
+      for (const auto &Import : ISec.getContent()) {
+        if (Import.getDesc().getDescType() ==
+            AST::Component::ExternDesc::DescType::TypeBound) {
+          if (CurrentIdx == TypeIdx) {
+            return nullptr;
+          }
+          CurrentIdx++;
+        }
+      }
+    } else if (std::holds_alternative<AST::Component::AliasSection>(Sec)) {
+      const auto &ASec = std::get<AST::Component::AliasSection>(Sec);
+      for (const auto &Alias : ASec.getContent()) {
+        if (!Alias.getSort().isCore() &&
+            Alias.getSort().getSortType() ==
+                AST::Component::Sort::SortType::Type) {
+          if (CurrentIdx == TypeIdx) {
+            return nullptr;
+          }
+          CurrentIdx++;
+        }
+      }
+    }
+  }
+  return nullptr;
+}
+
+// The resource type index that a child component's value type owns/borrows,
+// peeling a single own/borrow layer (direct code or a TypeIndex to an
+// own/borrow DefValType in the child's type space).
+std::optional<uint32_t>
+childValTypeResource(const AST::Component::Component &Comp,
+                     const ComponentValType &VT) {
+  if (VT.getCode() == ComponentTypeCode::Own ||
+      VT.getCode() == ComponentTypeCode::Borrow) {
+    return VT.getTypeIndex();
+  }
+  if (VT.getCode() == ComponentTypeCode::TypeIndex) {
+    const auto *DT = resolveChildDefType(Comp, VT.getTypeIndex());
+    if (DT != nullptr && DT->isDefValType()) {
+      const auto &D = DT->getDefValType();
+      if (D.isOwnTy()) {
+        return D.getOwn().Idx;
+      }
+      if (D.isBorrowTy()) {
+        return D.getBorrow().Idx;
+      }
+    }
+  }
+  return std::nullopt;
+}
+
 // Resolve a ComponentValType to the resource type index it owns, peeling
 // nested result<...> layers (a [constructor] may return (own R),
 // (result (own R)), (result (own R) (error E)), etc.).
@@ -1415,6 +1483,69 @@ Validator::validate(const AST::Component::Instance &Inst) noexcept {
       if (!Sort.isCore() &&
           Sort.getSortType() == AST::Component::Sort::SortType::Instance) {
         ArgInstanceIdx[ImportName] = Idx;
+      }
+      // C2b: a function argument provided for a function import must have
+      // resource params/results matching the import's required function type
+      // under the instantiation substitution (the type args bound above).
+      if (Comp != nullptr && !Sort.isCore() &&
+          Sort.getSortType() == AST::Component::Sort::SortType::Func &&
+          ImportDesc.getDescType() ==
+              AST::Component::ExternDesc::DescType::FuncType) {
+        const auto *ReqDT =
+            resolveChildDefType(*Comp, ImportDesc.getTypeIndex());
+        const auto *ProvFT = CompCtx.getFunc(Idx);
+        if (ReqDT != nullptr && ReqDT->isFuncType() && ProvFT != nullptr) {
+          const auto &ReqFT = ReqDT->getFuncType();
+          // Required resource id of a child value type, mapped through the
+          // substitution (child import name -> bound argument id).
+          auto ReqResId =
+              [&](const ComponentValType &VT) -> std::optional<uint64_t> {
+            if (auto CIdx = childValTypeResource(*Comp, VT)) {
+              const auto CR = resolveChildResource(*Comp, *CIdx);
+              if (CR.IsResource && !CR.ImportName.empty()) {
+                auto It = ArgResourceIds.find(CR.ImportName);
+                if (It != ArgResourceIds.end()) {
+                  return It->second.first;
+                }
+              }
+            }
+            return std::nullopt;
+          };
+          auto ProvResId =
+              [&](const ComponentValType &VT) -> std::optional<uint64_t> {
+            if (auto OIdx = ownOrBorrowResource(CompCtx, VT)) {
+              if (const auto *R = CompCtx.getResource(*OIdx)) {
+                return R->Id;
+              }
+            }
+            return std::nullopt;
+          };
+          auto Mismatch = [&](const ComponentValType &Req,
+                              const ComponentValType &Prov) {
+            const auto R = ReqResId(Req);
+            const auto P = ProvResId(Prov);
+            return R.has_value() && P.has_value() && *R != *P;
+          };
+          const auto &RP = ReqFT.getParamList();
+          const auto &PP = ProvFT->getParamList();
+          const auto &RR = ReqFT.getResultList();
+          const auto &PR = ProvFT->getResultList();
+          bool Bad = RP.size() != PP.size() || RR.size() != PR.size();
+          for (size_t I = 0; !Bad && I < RP.size(); ++I) {
+            Bad = Mismatch(RP[I].getValType(), PP[I].getValType());
+          }
+          for (size_t I = 0; !Bad && I < RR.size(); ++I) {
+            Bad = Mismatch(RR[I].getValType(), PR[I].getValType());
+          }
+          if (Bad) {
+            spdlog::error(ErrCode::Value::ArgTypeMismatch);
+            spdlog::error("    Instance: Argument '{}' function resource types "
+                          "do not match the import"sv,
+                          ImportName);
+            spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Instance));
+            return Unexpect(ErrCode::Value::ArgTypeMismatch);
+          }
+        }
       }
       return {};
     };
