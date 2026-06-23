@@ -334,6 +334,138 @@ childValTypeResource(const AST::Component::Component &Comp,
   return std::nullopt;
 }
 
+// A child component's complete type index space (type section, type-bound
+// imports, type aliases, and export-of-type), in the order the loader assigns
+// indices. AliasSource is the underlying type index for an export-of-type so
+// own/borrow references can be canonicalised back to the defining resource.
+struct ChildTSEntry {
+  const AST::Component::DefType *DT = nullptr;
+  std::optional<uint32_t> AliasSource;
+};
+
+std::vector<ChildTSEntry>
+buildChildTypeSpace(const AST::Component::Component &Comp) {
+  std::vector<ChildTSEntry> TS;
+  for (const auto &Sec : Comp.getSections()) {
+    if (const auto *T = std::get_if<AST::Component::TypeSection>(&Sec)) {
+      for (const auto &DT : T->getContent()) {
+        TS.push_back({&DT, std::nullopt});
+      }
+    } else if (const auto *I =
+                   std::get_if<AST::Component::ImportSection>(&Sec)) {
+      for (const auto &Imp : I->getContent()) {
+        if (Imp.getDesc().getDescType() ==
+            AST::Component::ExternDesc::DescType::TypeBound) {
+          TS.push_back({nullptr, std::nullopt});
+        }
+      }
+    } else if (const auto *A =
+                   std::get_if<AST::Component::AliasSection>(&Sec)) {
+      for (const auto &Al : A->getContent()) {
+        if (!Al.getSort().isCore() &&
+            Al.getSort().getSortType() ==
+                AST::Component::Sort::SortType::Type) {
+          TS.push_back({nullptr, std::nullopt});
+        }
+      }
+    } else if (const auto *E =
+                   std::get_if<AST::Component::ExportSection>(&Sec)) {
+      for (const auto &Ex : E->getContent()) {
+        const auto &S = Ex.getSortIndex().getSort();
+        if (!S.isCore() &&
+            S.getSortType() == AST::Component::Sort::SortType::Type) {
+          TS.push_back({nullptr, Ex.getSortIndex().getIdx()});
+        }
+      }
+    }
+  }
+  return TS;
+}
+
+// Follow export-of-type indirections to the underlying type index.
+uint32_t canonicalizeChildTypeIdx(const std::vector<ChildTSEntry> &TS,
+                                  uint32_t Idx) {
+  for (unsigned G = 0;
+       G < 64u && Idx < TS.size() && TS[Idx].AliasSource.has_value(); ++G) {
+    Idx = *TS[Idx].AliasSource;
+  }
+  return Idx;
+}
+
+// The (canonicalised) resource type index a value type owns/borrows, using the
+// complete child type space (so export-of-type and own/borrow type decls
+// resolve even when interleaved).
+std::optional<uint32_t>
+childValTypeResourceTS(const std::vector<ChildTSEntry> &TS,
+                       const ComponentValType &VT) {
+  uint32_t Target;
+  if (VT.getCode() == ComponentTypeCode::Own ||
+      VT.getCode() == ComponentTypeCode::Borrow) {
+    Target = VT.getTypeIndex();
+  } else if (VT.getCode() == ComponentTypeCode::TypeIndex) {
+    const uint32_t TI = canonicalizeChildTypeIdx(TS, VT.getTypeIndex());
+    if (TI >= TS.size() || TS[TI].DT == nullptr || !TS[TI].DT->isDefValType()) {
+      return std::nullopt;
+    }
+    const auto &D = TS[TI].DT->getDefValType();
+    if (D.isOwnTy()) {
+      Target = D.getOwn().Idx;
+    } else if (D.isBorrowTy()) {
+      Target = D.getBorrow().Idx;
+    } else {
+      return std::nullopt;
+    }
+  } else {
+    return std::nullopt;
+  }
+  return canonicalizeChildTypeIdx(TS, Target);
+}
+
+// Resolve a child component's func index to the component func type index it
+// declares (function imports, then canon lift entries; aliased funcs are not
+// resolved here).
+std::optional<uint32_t>
+resolveChildComponentFuncTypeIdx(const AST::Component::Component &Comp,
+                                 uint32_t FuncIdx) {
+  uint32_t Cur = 0;
+  for (const auto &Sec : Comp.getSections()) {
+    if (const auto *I = std::get_if<AST::Component::ImportSection>(&Sec)) {
+      for (const auto &Imp : I->getContent()) {
+        if (Imp.getDesc().getDescType() ==
+            AST::Component::ExternDesc::DescType::FuncType) {
+          if (Cur == FuncIdx) {
+            return Imp.getDesc().getTypeIndex();
+          }
+          ++Cur;
+        }
+      }
+    } else if (const auto *C =
+                   std::get_if<AST::Component::CanonSection>(&Sec)) {
+      for (const auto &Can : C->getContent()) {
+        if (Can.getOpCode() == ComponentCanonOpCode::Lift) {
+          if (Cur == FuncIdx) {
+            return Can.getTargetIndex();
+          }
+          ++Cur;
+        }
+      }
+    } else if (const auto *A =
+                   std::get_if<AST::Component::AliasSection>(&Sec)) {
+      for (const auto &Al : A->getContent()) {
+        if (!Al.getSort().isCore() &&
+            Al.getSort().getSortType() ==
+                AST::Component::Sort::SortType::Func) {
+          if (Cur == FuncIdx) {
+            return std::nullopt;
+          }
+          ++Cur;
+        }
+      }
+    }
+  }
+  return std::nullopt;
+}
+
 // Resolve a ComponentValType to the resource type index it owns, peeling
 // nested result<...> layers (a [constructor] may return (own R),
 // (result (own R)), (result (own R) (error E)), etc.).
@@ -1758,6 +1890,11 @@ Validator::validate(const AST::Component::Instance &Inst) noexcept {
     // TODO (GAP-I-3): fresh ResourceIds + per-export resource remapping.
     uint32_t InstanceIdx = CompCtx.addInstance();
     if (Comp != nullptr) {
+      // Complete child type space + a map from each (canonicalised) resource
+      // type index to the id it receives in this instantiation, so a function
+      // export can record the resource identities of its params/results.
+      const auto ChildTS = buildChildTypeSpace(*Comp);
+      std::unordered_map<uint32_t, uint64_t> ChildResIdToId;
       for (const auto &Sec : Comp->getSections()) {
         const auto *ES = std::get_if<AST::Component::ExportSection>(&Sec);
         if (ES == nullptr) {
@@ -1784,16 +1921,28 @@ Validator::validate(const AST::Component::Instance &Inst) noexcept {
           if (ExpSort.getSortType() == AST::Component::Sort::SortType::Type) {
             const auto CR =
                 resolveChildResource(*Comp, Exp.getSortIndex().getIdx());
+            const uint32_t RootIdx =
+                canonicalizeChildTypeIdx(ChildTS, Exp.getSortIndex().getIdx());
             if (CR.IsResource) {
               if (CR.LocallyDefined) {
-                // Generative: defined in the child, not local to this scope.
-                ResourceId = CompCtx.allocateFreshResourceId();
+                // Generative: one identity per instantiation, shared by every
+                // export of the same resource (canonicalised root index).
+                auto Existing = ChildResIdToId.find(RootIdx);
+                if (Existing != ChildResIdToId.end()) {
+                  ResourceId = Existing->second;
+                } else {
+                  ResourceId = CompCtx.allocateFreshResourceId();
+                  ChildResIdToId[RootIdx] = *ResourceId;
+                }
               } else {
                 auto It = ArgResourceIds.find(CR.ImportName);
                 if (It != ArgResourceIds.end()) {
                   ResourceId = It->second.first;
                   ResourceLocal = It->second.second;
                 }
+              }
+              if (ResourceId.has_value()) {
+                ChildResIdToId[RootIdx] = *ResourceId;
               }
             } else if (!CR.InstImportName.empty()) {
               // Resource re-exported from an imported instance: inherit the id
@@ -1830,6 +1979,39 @@ Validator::validate(const AST::Component::Instance &Inst) noexcept {
           CompCtx.addInstanceExport(InstanceIdx, Exp.getName(),
                                     ExpSort.getSortType(), IT, NestedInstIdx,
                                     ResourceId, ResourceLocal);
+          // A function export records the resource identities of its params /
+          // results (resolved via the child type space + the resource ids
+          // assigned above) so an alias-export of it carries the signature.
+          if (ExpSort.getSortType() == AST::Component::Sort::SortType::Func) {
+            if (auto FTI = resolveChildComponentFuncTypeIdx(
+                    *Comp, Exp.getSortIndex().getIdx())) {
+              const uint32_t CFTI = canonicalizeChildTypeIdx(ChildTS, *FTI);
+              if (CFTI < ChildTS.size() && ChildTS[CFTI].DT != nullptr &&
+                  ChildTS[CFTI].DT->isFuncType()) {
+                const auto &FT = ChildTS[CFTI].DT->getFuncType();
+                auto ResOf =
+                    [&](const ComponentValType &VT) -> std::optional<uint64_t> {
+                  if (auto R = childValTypeResourceTS(ChildTS, VT)) {
+                    auto It = ChildResIdToId.find(*R);
+                    if (It != ChildResIdToId.end()) {
+                      return It->second;
+                    }
+                  }
+                  return std::nullopt;
+                };
+                std::vector<std::optional<uint64_t>> Params, Results;
+                for (const auto &P : FT.getParamList()) {
+                  Params.push_back(ResOf(P.getValType()));
+                }
+                for (const auto &R : FT.getResultList()) {
+                  Results.push_back(ResOf(R.getValType()));
+                }
+                CompCtx.setInstanceExportFuncSig(InstanceIdx, Exp.getName(),
+                                                 std::move(Params),
+                                                 std::move(Results));
+              }
+            }
+          }
         }
       }
     } else if (CompTy != nullptr) {
