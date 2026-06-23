@@ -2752,15 +2752,35 @@ Expect<void> Validator::validate(const AST::Component::Import &Im) noexcept {
   // The per-annotated-name structural checks (constructor result type,
   // method `self` param, static resource name in scope) are not yet
   // implemented and tracked as follow-ups below.
-  // Snapshot the type space size before validating the desc so we can
-  // recover the new type index allocated by a TypeBound (sub resource).
+  // Snapshot the type / instance space sizes before validating the desc so we
+  // can recover the new index allocated by a TypeBound (sub resource) or an
+  // instance import and mark the imported resources as importable.
   const uint32_t TypeSpaceBefore =
       CompCtx.getSortIndexSize(AST::Component::Sort::SortType::Type);
+  const uint32_t InstSpaceBefore =
+      CompCtx.getSortIndexSize(AST::Component::Sort::SortType::Instance);
 
   EXPECTED_TRY(validate(Im.getDesc()).map_error([](auto E) {
     spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Import));
     return E;
   }));
+
+  // Mark resources introduced by this import as importable so a later function
+  // import may reference them.
+  if (Im.getDesc().getDescType() ==
+      AST::Component::ExternDesc::DescType::TypeBound) {
+    if (const auto *RInfo = CompCtx.getResource(TypeSpaceBefore)) {
+      CompCtx.markResourceImportable(RInfo->Id);
+    }
+  } else if (Im.getDesc().getDescType() ==
+             AST::Component::ExternDesc::DescType::InstanceType) {
+    for (const auto &[Name, IE] :
+         CompCtx.getInstance(InstSpaceBefore).Exports) {
+      if (IE.ResourceId.has_value()) {
+        CompCtx.markResourceImportable(*IE.ResourceId);
+      }
+    }
+  }
 
   EXPECTED_TRY(ComponentName CName,
                ComponentName::parse(Im.getName()).map_error([](auto E) {
@@ -2834,18 +2854,18 @@ Expect<void> Validator::validate(const AST::Component::Import &Im) noexcept {
   }
 
   // A function imported into this component may only reference resources that
-  // are importable (imported, hence not locally defined). Using a
-  // locally-defined resource in an import function is invalid.
+  // are importable (imported into this component, directly or via an imported
+  // instance). A locally-defined or exported-only resource is not.
   if (Im.getDesc().getDescType() ==
       AST::Component::ExternDesc::DescType::FuncType) {
     const auto *DT = CompCtx.getDefType(Im.getDesc().getTypeIndex());
     if (DT != nullptr && DT->isFuncType()) {
       for (uint32_t RIdx : funcResourceIndices(CompCtx, DT->getFuncType())) {
         const auto *RInfo = CompCtx.getResource(RIdx);
-        if (RInfo != nullptr && RInfo->LocallyDefined) {
+        if (RInfo != nullptr && !CompCtx.isResourceImportable(RInfo->Id)) {
           spdlog::error(ErrCode::Value::InvalidTypeReference);
-          spdlog::error("    Import: function references a locally-defined "
-                        "resource and is not valid as an import"sv);
+          spdlog::error("    Import: function references a resource not "
+                        "importable in this context"sv);
           spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Import));
           return Unexpect(ErrCode::Value::InvalidTypeReference);
         }
@@ -3252,9 +3272,45 @@ Validator::validate(const AST::Component::ImportDecl &Decl) noexcept {
 
   const uint32_t TypeSpaceBefore =
       CompCtx.getSortIndexSize(AST::Component::Sort::SortType::Type);
+  const uint32_t InstSpaceBefore =
+      CompCtx.getSortIndexSize(AST::Component::Sort::SortType::Instance);
 
   // Validate the extern descriptor (also increments sort index spaces).
   EXPECTED_TRY(validate(Decl.getExternDesc()).map_error(ReportError));
+
+  // Mark resources introduced by this import as importable.
+  if (Decl.getExternDesc().getDescType() ==
+      AST::Component::ExternDesc::DescType::TypeBound) {
+    if (const auto *RInfo = CompCtx.getResource(TypeSpaceBefore)) {
+      CompCtx.markResourceImportable(RInfo->Id);
+    }
+  } else if (Decl.getExternDesc().getDescType() ==
+             AST::Component::ExternDesc::DescType::InstanceType) {
+    for (const auto &[Name, IE] :
+         CompCtx.getInstance(InstSpaceBefore).Exports) {
+      if (IE.ResourceId.has_value()) {
+        CompCtx.markResourceImportable(*IE.ResourceId);
+      }
+    }
+  }
+
+  // A function imported here may only reference importable resources.
+  if (Decl.getExternDesc().getDescType() ==
+      AST::Component::ExternDesc::DescType::FuncType) {
+    const auto *DT = CompCtx.getDefType(Decl.getExternDesc().getTypeIndex());
+    if (DT != nullptr && DT->isFuncType()) {
+      for (uint32_t RIdx : funcResourceIndices(CompCtx, DT->getFuncType())) {
+        const auto *RInfo = CompCtx.getResource(RIdx);
+        if (RInfo != nullptr && !CompCtx.isResourceImportable(RInfo->Id)) {
+          spdlog::error(ErrCode::Value::InvalidTypeReference);
+          spdlog::error("    ImportDecl: function references a resource not "
+                        "importable in this context"sv);
+          spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Decl_Import));
+          return Unexpect(ErrCode::Value::InvalidTypeReference);
+        }
+      }
+    }
+  }
 
   // Parse and validate the import name.
   EXPECTED_TRY(ComponentName CName,

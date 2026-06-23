@@ -157,6 +157,9 @@ public:
     // Resource ids exported from this component (directly or via an exported
     // instance), so a function exported from here may reference them.
     std::unordered_set<uint64_t> ExportedResourceIds;
+    // Resource ids imported into this component (directly or via an imported
+    // instance), so a function imported here may reference them.
+    std::unordered_set<uint64_t> ImportableResourceIds;
 
     // ---- Validation state ----
     std::unordered_map<std::string, uint32_t> TypeSubstitutions;
@@ -548,6 +551,13 @@ public:
   }
   bool isResourceExported(uint64_t Id) const noexcept {
     const auto &S = getCurrentContext().ExportedResourceIds;
+    return S.find(Id) != S.end();
+  }
+  void markResourceImportable(uint64_t Id) noexcept {
+    getCurrentContext().ImportableResourceIds.insert(Id);
+  }
+  bool isResourceImportable(uint64_t Id) const noexcept {
+    const auto &S = getCurrentContext().ImportableResourceIds;
     return S.find(Id) != S.end();
   }
 
