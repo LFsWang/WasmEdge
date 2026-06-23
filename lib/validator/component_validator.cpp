@@ -152,8 +152,72 @@ struct ChildResourceInfo {
   // the export name within it. The caller resolves the identity from the
   // instantiation argument bound to InstImportName (GAP-I-3).
   std::string_view InstImportName;
-  std::string_view InstExportName;
+  // Export names to follow from the imported instance down to the resource,
+  // one per nesting level (e.g. {"i1", "i2"} for a resource reached as
+  // x."i1"."i2"). The last element is the resource export name.
+  std::vector<std::string_view> InstPath;
 };
+
+// Provenance of a child component's instance index: the root instance-import
+// name and the chain of export names from it (empty root if not import-rooted).
+struct ChildInstanceProvenance {
+  std::string_view RootImport;
+  std::vector<std::string_view> Path;
+};
+
+ChildInstanceProvenance
+resolveChildInstanceProvenance(const AST::Component::Component &Comp,
+                               uint32_t InstIdx, unsigned Depth = 0) {
+  if (Depth > 32u) {
+    return {};
+  }
+  uint32_t CurrentIdx = 0;
+  for (const auto &Sec : Comp.getSections()) {
+    if (const auto *ISec = std::get_if<AST::Component::ImportSection>(&Sec)) {
+      for (const auto &Import : ISec->getContent()) {
+        if (Import.getDesc().getDescType() ==
+            AST::Component::ExternDesc::DescType::InstanceType) {
+          if (CurrentIdx == InstIdx) {
+            return {Import.getName(), {}};
+          }
+          CurrentIdx++;
+        }
+      }
+    } else if (const auto *NSec =
+                   std::get_if<AST::Component::InstanceSection>(&Sec)) {
+      for (const auto &Inst : NSec->getContent()) {
+        static_cast<void>(Inst);
+        if (CurrentIdx == InstIdx) {
+          return {}; // instantiate / inline-export: not import-rooted here
+        }
+        CurrentIdx++;
+      }
+    } else if (const auto *ASec =
+                   std::get_if<AST::Component::AliasSection>(&Sec)) {
+      for (const auto &Alias : ASec->getContent()) {
+        if (!Alias.getSort().isCore() &&
+            Alias.getSort().getSortType() ==
+                AST::Component::Sort::SortType::Instance) {
+          if (CurrentIdx == InstIdx) {
+            if (Alias.getTargetType() ==
+                AST::Component::Alias::TargetType::Export) {
+              const auto &Exp = Alias.getExport();
+              auto P =
+                  resolveChildInstanceProvenance(Comp, Exp.first, Depth + 1);
+              if (!P.RootImport.empty()) {
+                P.Path.push_back(Exp.second);
+                return P;
+              }
+            }
+            return {};
+          }
+          CurrentIdx++;
+        }
+      }
+    }
+  }
+  return {};
+}
 
 // Map a child component instance index to the name of the instance IMPORT at
 // that index, or empty if the index is not an instance import. The instance
@@ -248,11 +312,12 @@ ChildResourceInfo resolveChildResource(const AST::Component::Component &Comp,
             if (Alias.getTargetType() ==
                 AST::Component::Alias::TargetType::Export) {
               const auto &Exp = Alias.getExport();
-              const auto InstName = childInstanceImportName(Comp, Exp.first);
-              if (!InstName.empty()) {
+              auto Prov = resolveChildInstanceProvenance(Comp, Exp.first);
+              if (!Prov.RootImport.empty()) {
                 ChildResourceInfo CR;
-                CR.InstImportName = InstName;
-                CR.InstExportName = Exp.second;
+                CR.InstImportName = Prov.RootImport;
+                CR.InstPath = std::move(Prov.Path);
+                CR.InstPath.push_back(Exp.second);
                 return CR;
               }
             }
@@ -757,9 +822,12 @@ void Validator::populateInstanceFromType(
     const AST::Component::InstanceType *NestedIT = nullptr;
     if (ED.getDescType() ==
         AST::Component::ExternDesc::DescType::InstanceType) {
-      NestedIT = CompCtx.getInstanceType(ED.getTypeIndex());
+      // The type index is local to this instance-type body, so resolve it
+      // within the body first; only fall back to the enclosing scope's
+      // registry when it is not a local nested instance type.
+      NestedIT = resolveNestedInstanceType(IT, ED.getTypeIndex());
       if (NestedIT == nullptr) {
-        NestedIT = resolveNestedInstanceType(IT, ED.getTypeIndex());
+        NestedIT = CompCtx.getInstanceType(ED.getTypeIndex());
       }
     }
     std::optional<uint64_t> ResourceId;
@@ -1944,18 +2012,33 @@ Validator::validate(const AST::Component::Instance &Inst) noexcept {
               if (ResourceId.has_value()) {
                 ChildResIdToId[RootIdx] = *ResourceId;
               }
-            } else if (!CR.InstImportName.empty()) {
-              // Resource re-exported from an imported instance: inherit the id
-              // from the instance argument's matching resource export
-              // (GAP-I-3).
+            } else if (!CR.InstImportName.empty() && !CR.InstPath.empty()) {
+              // Resource re-exported from an imported instance, possibly nested
+              // through instance-of-instance exports: walk the path from the
+              // instance argument down to the resource and inherit its id
+              // (GAP-I-3 / GAP-I-5b).
               auto It = ArgInstanceIdx.find(CR.InstImportName);
               if (It != ArgInstanceIdx.end()) {
-                const auto &Exports = CompCtx.getInstance(It->second).Exports;
-                auto EIt = Exports.find(std::string(CR.InstExportName));
-                if (EIt != Exports.end() &&
-                    EIt->second.ResourceId.has_value()) {
-                  ResourceId = EIt->second.ResourceId;
-                  ResourceLocal = EIt->second.ResourceLocallyDefined;
+                uint32_t CurInst = It->second;
+                bool Ok = true;
+                for (size_t H = 0; H + 1 < CR.InstPath.size() && Ok; ++H) {
+                  const auto &Exports = CompCtx.getInstance(CurInst).Exports;
+                  auto HIt = Exports.find(std::string(CR.InstPath[H]));
+                  if (HIt != Exports.end() &&
+                      HIt->second.NestedInstIdx.has_value()) {
+                    CurInst = *HIt->second.NestedInstIdx;
+                  } else {
+                    Ok = false;
+                  }
+                }
+                if (Ok) {
+                  const auto &Exports = CompCtx.getInstance(CurInst).Exports;
+                  auto EIt = Exports.find(std::string(CR.InstPath.back()));
+                  if (EIt != Exports.end() &&
+                      EIt->second.ResourceId.has_value()) {
+                    ResourceId = EIt->second.ResourceId;
+                    ResourceLocal = EIt->second.ResourceLocallyDefined;
+                  }
                 }
               }
             }
