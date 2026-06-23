@@ -49,7 +49,12 @@ Expect<void> CanonLowerHostFunc::run(const Runtime::CallingFrame &,
   // Lower-direction CanonCtx: Memory/Realloc come from the canon lower
   // options. Exec is needed by callRealloc inside lower_flat_values when
   // nested strings/lists in results need their own buffer.
+  // Borrow scope for this lowered call (canon lower runs as a Subtask):
+  // lift_borrow on params registers lenders whose num_lends are released when
+  // the subtask resolves (after the wrapped callee returns).
+  Runtime::Instance::Component::BorrowScope Scope;
   CanonicalABI::CanonCtx Cx{Exec, Memory, Realloc, CompInst, {}, Enc};
+  Cx.Scope = &Scope;
 
   // Collect component-level param + result types from the callee.
   const auto &CFT = Callee->getFuncType();
@@ -86,6 +91,9 @@ Expect<void> CanonLowerHostFunc::run(const Runtime::CallingFrame &,
 
   // Invoke the wrapped component function.
   EXPECTED_TRY(auto CompRes, Exec->invoke(Callee, Params, ParamTypes));
+
+  // Subtask resolved: release the lenders borrowed for this call.
+  Scope.resolve();
 
   std::vector<ComponentValVariant> ResultValues;
   ResultValues.reserve(CompRes.size());

@@ -1273,6 +1273,71 @@ namespace {
 Expect<ComponentValVariant>
 liftListFromRange(const CanonCtx &Cx, uint32_t Begin, uint32_t Length,
                   const ComponentValType &ElemT) noexcept;
+
+namespace RIC = Runtime::Instance::Component;
+
+// lift_own (definitions.py L2297-2303): remove the handle from the caller's
+// table, transferring ownership out, and return its representation.
+Expect<uint32_t> liftOwn(const CanonCtx &Cx, uint32_t Handle,
+                         const AST::Component::OwnTy &T) noexcept {
+  const auto *Rt = resolveDefType(Cx, T.Idx);
+  EXPECTED_TRY(RIC::ResourceHandle H,
+               Cx.CompInst->getResourceTable().remove(Handle));
+  if (H.Rt != Rt) {
+    EXPECTED_TRY(trapDataInvalid("own handle type mismatch"));
+  }
+  if (H.NumLends != 0) {
+    EXPECTED_TRY(trapDataInvalid("own handle still lent"));
+  }
+  if (!H.Own) {
+    EXPECTED_TRY(trapDataInvalid("expected own handle, got borrow"));
+  }
+  return H.Rep;
+}
+
+// lower_own (definitions.py L2306-2308): create a fresh owning handle in the
+// receiver's table and return its index.
+Expect<uint32_t> lowerOwn(const CanonCtx &Cx, uint32_t Rep,
+                          const AST::Component::OwnTy &T) noexcept {
+  RIC::ResourceHandle H{};
+  H.Rt = resolveDefType(Cx, T.Idx);
+  H.DefiningInst = Cx.CompInst;
+  H.Rep = Rep;
+  H.Own = true;
+  return Cx.CompInst->getResourceTable().add(H);
+}
+
+// lift_borrow (definitions.py L2316-2322): keep the handle in the caller's
+// table, register it as a lender of the current borrow scope, and return its
+// representation.
+Expect<uint32_t> liftBorrow(const CanonCtx &Cx, uint32_t Handle,
+                            const AST::Component::BorrowTy &T) noexcept {
+  const auto *Rt = resolveDefType(Cx, T.Idx);
+  EXPECTED_TRY(auto *H, Cx.CompInst->getResourceTable().get(Handle));
+  if (H->Rt != Rt) {
+    EXPECTED_TRY(trapDataInvalid("borrow handle type mismatch"));
+  }
+  if (Cx.Scope != nullptr) {
+    Cx.Scope->addLender(H);
+  }
+  return H->Rep;
+}
+
+// lower_borrow (definitions.py L2325-2333): create a borrowed handle in the
+// receiver's table, charged to the current borrow scope, and return its index.
+Expect<uint32_t> lowerBorrow(const CanonCtx &Cx, uint32_t Rep,
+                             const AST::Component::BorrowTy &T) noexcept {
+  RIC::ResourceHandle H{};
+  H.Rt = resolveDefType(Cx, T.Idx);
+  H.DefiningInst = Cx.CompInst;
+  H.Rep = Rep;
+  H.Own = false;
+  H.Scope = Cx.Scope;
+  if (Cx.Scope != nullptr) {
+    Cx.Scope->NumBorrows++;
+  }
+  return Cx.CompInst->getResourceTable().add(H);
+}
 } // namespace
 
 Expect<ComponentValVariant> load(const CanonCtx &Cx, uint32_t Ptr,
@@ -1465,19 +1530,21 @@ loadDef(const CanonCtx &Cx, uint32_t Ptr,
     return makeComponentVal(EnumVal{Case});
   }
 
-  // lift_own / lift_borrow (L2297-2303 / L2316-2322): resource-table
-  // interaction is not yet implemented; the raw handle is preserved verbatim
-  // so future support can pick it up.
+  // load own / borrow: read the i32 handle index from memory, then lift it
+  // through the resource table (lift_own removes / lift_borrow registers a
+  // lender) and store the resulting representation in the component value.
   if (T.isOwnTy()) {
     uint32_t H = 0;
     EXPECTED_TRY(Cx.Mem->loadValue<uint32_t>(H, Ptr));
-    return makeComponentVal(OwnVal{H});
+    EXPECTED_TRY(uint32_t Rep, liftOwn(Cx, H, T.getOwn()));
+    return makeComponentVal(OwnVal{Rep});
   }
 
   if (T.isBorrowTy()) {
     uint32_t H = 0;
     EXPECTED_TRY(Cx.Mem->loadValue<uint32_t>(H, Ptr));
-    return makeComponentVal(BorrowVal{H});
+    EXPECTED_TRY(uint32_t Rep, liftBorrow(Cx, H, T.getBorrow()));
+    return makeComponentVal(BorrowVal{Rep});
   }
 
   // stream / future are deferred.
@@ -1761,18 +1828,23 @@ Expect<void> storeDef(const CanonCtx &Cx, const ComponentValVariant &V,
     return storeN<uint32_t>(*Cx.Mem, DiscSize, E.Case, Ptr);
   }
 
+  // store own / borrow: lower the representation into a fresh table handle
+  // (lower_own creates an owning handle / lower_borrow a borrowed one) and
+  // write the resulting i32 handle index to memory.
   if (T.isOwnTy()) {
     const auto &VC = std::get<std::shared_ptr<ValComp>>(V);
     assuming(VC);
     const auto &O = std::get<OwnVal>(VC->V);
-    return Cx.Mem->storeValue<uint32_t>(O.Handle, Ptr);
+    EXPECTED_TRY(uint32_t Handle, lowerOwn(Cx, O.Rep, T.getOwn()));
+    return Cx.Mem->storeValue<uint32_t>(Handle, Ptr);
   }
 
   if (T.isBorrowTy()) {
     const auto &VC = std::get<std::shared_ptr<ValComp>>(V);
     assuming(VC);
     const auto &B = std::get<BorrowVal>(VC->V);
-    return Cx.Mem->storeValue<uint32_t>(B.Handle, Ptr);
+    EXPECTED_TRY(uint32_t Handle, lowerBorrow(Cx, B.Rep, T.getBorrow()));
+    return Cx.Mem->storeValue<uint32_t>(Handle, Ptr);
   }
 
   spdlog::error(ErrCode::Value::ComponentNotImplInstantiate);
@@ -2108,13 +2180,16 @@ liftFlatDef(const CanonCtx &Cx, FlatIter &VI,
   if (T.isOwnTy()) {
     auto Next = VI.next();
     assuming(Next.has_value());
-    return makeComponentVal(OwnVal{Next->get<uint32_t>()});
+    EXPECTED_TRY(uint32_t Rep, liftOwn(Cx, Next->get<uint32_t>(), T.getOwn()));
+    return makeComponentVal(OwnVal{Rep});
   }
 
   if (T.isBorrowTy()) {
     auto Next = VI.next();
     assuming(Next.has_value());
-    return makeComponentVal(BorrowVal{Next->get<uint32_t>()});
+    EXPECTED_TRY(uint32_t Rep,
+                 liftBorrow(Cx, Next->get<uint32_t>(), T.getBorrow()));
+    return makeComponentVal(BorrowVal{Rep});
   }
 
   if (T.isVariantTy() || T.isOptionTy() || T.isResultTy()) {
@@ -2411,14 +2486,16 @@ lowerFlatDef(const CanonCtx &Cx, const ComponentValVariant &V,
     const auto &VC = std::get<std::shared_ptr<ValComp>>(V);
     assuming(VC);
     const auto &O = std::get<OwnVal>(VC->V);
-    return std::vector<ValVariant>{ValVariant(O.Handle)};
+    EXPECTED_TRY(uint32_t Handle, lowerOwn(Cx, O.Rep, T.getOwn()));
+    return std::vector<ValVariant>{ValVariant(Handle)};
   }
 
   if (T.isBorrowTy()) {
     const auto &VC = std::get<std::shared_ptr<ValComp>>(V);
     assuming(VC);
     const auto &B = std::get<BorrowVal>(VC->V);
-    return std::vector<ValVariant>{ValVariant(B.Handle)};
+    EXPECTED_TRY(uint32_t Handle, lowerBorrow(Cx, B.Rep, T.getBorrow()));
+    return std::vector<ValVariant>{ValVariant(Handle)};
   }
 
   if (T.isVariantTy() || T.isOptionTy() || T.isResultTy()) {

@@ -378,13 +378,14 @@ private:
 
   /// \name Helper Functions for canonical ABI
   /// @{
-  Expect<std::vector<ValVariant>>
-  convValsToCoreWASM(Span<const ComponentValVariant> Vals,
-                     Span<const ComponentValType> ValTypes,
-                     Runtime::Instance::FunctionInstance *RFuncInst,
-                     Runtime::Instance::MemoryInstance *MemInst,
-                     const Runtime::Instance::ComponentInstance *CompInst,
-                     StringEncoding Enc = StringEncoding::UTF8);
+  Expect<std::vector<ValVariant>> convValsToCoreWASM(
+      Span<const ComponentValVariant> Vals,
+      Span<const ComponentValType> ValTypes,
+      Runtime::Instance::FunctionInstance *RFuncInst,
+      Runtime::Instance::MemoryInstance *MemInst,
+      const Runtime::Instance::ComponentInstance *CompInst,
+      StringEncoding Enc = StringEncoding::UTF8,
+      Runtime::Instance::Component::BorrowScope *Scope = nullptr);
 
   Expect<std::vector<std::pair<ComponentValVariant, ComponentValType>>>
   convValsToComponent(Span<const std::pair<ValVariant, ValType>> CoreVals,

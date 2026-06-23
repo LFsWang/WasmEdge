@@ -235,13 +235,17 @@ Executor::invoke(const Runtime::Instance::Component::FunctionInstance *FuncInst,
     return Unexpect(ErrCode::Value::FuncSigMismatch);
   }
 
-  // Convert the component params into core WASM params.
+  // Convert the component params into core WASM params. The borrow scope spans
+  // the whole lifted call (canon lift runs as a Task): lower_borrow on params
+  // charges Scope.NumBorrows, the guest drops them via resource.drop, and we
+  // assert all borrows were dropped before the call returned.
+  Runtime::Instance::Component::BorrowScope Scope;
   auto *ReallocFuncInst = FuncInst->getAllocFunction();
   auto *MemInst = FuncInst->getMemoryInstance();
   EXPECTED_TRY(auto CoreWASMArgs,
                convValsToCoreWASM(Params, ParamTypes, ReallocFuncInst, MemInst,
                                   FuncInst->getComponentInstance(),
-                                  FuncInst->getStringEncoding()));
+                                  FuncInst->getStringEncoding(), &Scope));
 
   // Call runFunction.
   auto *CoreFuncInst = FuncInst->getLowerFunction();
@@ -250,6 +254,15 @@ Executor::invoke(const Runtime::Instance::Component::FunctionInstance *FuncInst,
   // TODO: COMPONENT - check the ABI types between core functype and args.
   EXPECTED_TRY(auto CoreWASMReturns, invoke(CoreFuncInst, CoreWASMArgs,
                                             CoreFuncType.getParamTypes()));
+
+  // Borrow invariant (CanonicalABI.md Task.return_): every borrow lowered into
+  // the callee must have been dropped before it returned.
+  if (Scope.NumBorrows != 0) {
+    spdlog::error(ErrCode::Value::ComponentTrap);
+    spdlog::error("    canonical ABI: {} borrow(s) not dropped before return"sv,
+                  Scope.NumBorrows);
+    return Unexpect(ErrCode::Value::ComponentTrap);
+  }
 
   // Get return values.
   std::vector<ComponentValType> ReturnTypes;

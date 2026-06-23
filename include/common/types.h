@@ -584,11 +584,14 @@ struct FlagsVal {
 struct EnumVal {
   uint32_t Case;
 };
+// Component-level own/borrow value. Between canon lift and lower the value
+// carries the resource representation (`rep`), not a table handle index:
+// lift_own/lift_borrow return `h.rep`, lower_own/lower_borrow consume it.
 struct OwnVal {
-  uint32_t Handle;
+  uint32_t Rep;
 };
 struct BorrowVal {
-  uint32_t Handle;
+  uint32_t Rep;
 };
 
 struct ValComp {

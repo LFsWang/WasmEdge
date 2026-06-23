@@ -66,6 +66,11 @@ struct CanonCtx {
   /// by load / store / lift_flat / lower_flat for `string` values. Defaults to
   /// UTF-8; type-only callers (alignment / flatten) never read it.
   StringEncoding Enc = StringEncoding::UTF8;
+  /// Borrow scope for the current lift/lower call (CanonicalABI.md
+  /// Task/Subtask borrow tracking, collapsed to a single synchronous call
+  /// frame). Set on the lift/lower value paths; null on type-only callers and
+  /// when no borrow handling is required.
+  Runtime::Instance::Component::BorrowScope *Scope = nullptr;
 };
 
 /// Resolve a component type index. Returns the DefType pointer using
