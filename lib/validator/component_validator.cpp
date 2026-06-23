@@ -147,7 +147,57 @@ struct ChildResourceInfo {
   bool IsResource = false;
   bool LocallyDefined = false;
   std::string_view ImportName; // set when the resource is an imported type
+  // Set when the type re-exports a resource pulled from an imported instance
+  // via `(alias export <inst> "name" (type))`: the instance import's name and
+  // the export name within it. The caller resolves the identity from the
+  // instantiation argument bound to InstImportName (GAP-I-3).
+  std::string_view InstImportName;
+  std::string_view InstExportName;
 };
+
+// Map a child component instance index to the name of the instance IMPORT at
+// that index, or empty if the index is not an instance import. The instance
+// index space is: instance imports + instance definitions + instance aliases,
+// in section order.
+std::string_view childInstanceImportName(const AST::Component::Component &Comp,
+                                         uint32_t InstIdx) {
+  uint32_t CurrentIdx = 0;
+  for (const auto &Sec : Comp.getSections()) {
+    if (std::holds_alternative<AST::Component::ImportSection>(Sec)) {
+      const auto &ISec = std::get<AST::Component::ImportSection>(Sec);
+      for (const auto &Import : ISec.getContent()) {
+        if (Import.getDesc().getDescType() ==
+            AST::Component::ExternDesc::DescType::InstanceType) {
+          if (CurrentIdx == InstIdx) {
+            return Import.getName();
+          }
+          CurrentIdx++;
+        }
+      }
+    } else if (std::holds_alternative<AST::Component::InstanceSection>(Sec)) {
+      const auto &InstSec = std::get<AST::Component::InstanceSection>(Sec);
+      for (size_t I = 0; I < InstSec.getContent().size(); ++I) {
+        if (CurrentIdx == InstIdx) {
+          return {}; // an instance definition, not an import
+        }
+        CurrentIdx++;
+      }
+    } else if (std::holds_alternative<AST::Component::AliasSection>(Sec)) {
+      const auto &ASec = std::get<AST::Component::AliasSection>(Sec);
+      for (const auto &Alias : ASec.getContent()) {
+        if (!Alias.getSort().isCore() &&
+            Alias.getSort().getSortType() ==
+                AST::Component::Sort::SortType::Instance) {
+          if (CurrentIdx == InstIdx) {
+            return {};
+          }
+          CurrentIdx++;
+        }
+      }
+    }
+  }
+  return {};
+}
 
 // Walk the child component's type index space (type sections + type-bound
 // imports + type aliases, in section order, mirroring resolveChildInstanceType)
@@ -160,8 +210,11 @@ ChildResourceInfo resolveChildResource(const AST::Component::Component &Comp,
       const auto &TSec = std::get<AST::Component::TypeSection>(Sec);
       for (const auto &DT : TSec.getContent()) {
         if (CurrentIdx == TypeIdx) {
-          return {
-              DT.isResourceType(), /*LocallyDefined=*/DT.isResourceType(), {}};
+          return {DT.isResourceType(),
+                  /*LocallyDefined=*/DT.isResourceType(),
+                  {},
+                  {},
+                  {}};
         }
         CurrentIdx++;
       }
@@ -173,8 +226,11 @@ ChildResourceInfo resolveChildResource(const AST::Component::Component &Comp,
           if (CurrentIdx == TypeIdx) {
             // `(sub resource)` is a resource import; `(eq i)` aliases type i.
             const bool IsRes = !Import.getDesc().isEqType();
-            return {IsRes, /*LocallyDefined=*/false,
-                    IsRes ? Import.getName() : std::string_view{}};
+            return {IsRes,
+                    /*LocallyDefined=*/false,
+                    IsRes ? Import.getName() : std::string_view{},
+                    {},
+                    {}};
           }
           CurrentIdx++;
         }
@@ -186,6 +242,20 @@ ChildResourceInfo resolveChildResource(const AST::Component::Component &Comp,
             Alias.getSort().getSortType() ==
                 AST::Component::Sort::SortType::Type) {
           if (CurrentIdx == TypeIdx) {
+            // An `(alias export <inst> "name" (type))` may re-export a resource
+            // from an imported instance; record the provenance so the caller
+            // can resolve the identity from the instantiation argument.
+            if (Alias.getTargetType() ==
+                AST::Component::Alias::TargetType::Export) {
+              const auto &Exp = Alias.getExport();
+              const auto InstName = childInstanceImportName(Comp, Exp.first);
+              if (!InstName.empty()) {
+                ChildResourceInfo CR;
+                CR.InstImportName = InstName;
+                CR.InstExportName = Exp.second;
+                return CR;
+              }
+            }
             return {}; // alias chain not resolved here (best-effort)
           }
           CurrentIdx++;
@@ -1174,6 +1244,9 @@ Validator::validate(const AST::Component::Instance &Inst) noexcept {
     // import name -> {resource id, locally-defined} of the type argument.
     std::unordered_map<std::string_view, std::pair<uint64_t, bool>>
         ArgResourceIds;
+    // instance import name -> instance argument index, so a resource
+    // re-exported from an imported instance inherits the argument's identity.
+    std::unordered_map<std::string_view, uint32_t> ArgInstanceIdx;
     auto checkImport =
         [&](std::string_view ImportName,
             const AST::Component::ExternDesc &ImportDesc) -> Expect<void> {
@@ -1251,9 +1324,55 @@ Validator::validate(const AST::Component::Instance &Inst) noexcept {
       // a re-exported imported resource can inherit it (see export loop below).
       if (!Sort.isCore() &&
           Sort.getSortType() == AST::Component::Sort::SortType::Type) {
-        if (const auto *RInfo = CompCtx.getResource(Idx)) {
-          ArgResourceIds[ImportName] = {RInfo->Id, RInfo->LocallyDefined};
+        const auto *ArgRes = CompCtx.getResource(Idx);
+        const bool ArgIsResource = ArgRes != nullptr;
+        // Argument kind / identity checks against the import (message
+        // secondary; reject at the validation phase). Relies on T1 tracking so
+        // instance-derived resource args carry a reliable id.
+        if (Comp != nullptr &&
+            ImportDesc.getDescType() ==
+                AST::Component::ExternDesc::DescType::TypeBound) {
+          if (ImportDesc.isEqType()) {
+            const auto Tgt =
+                resolveChildResource(*Comp, ImportDesc.getTypeIndex());
+            if (Tgt.IsResource != ArgIsResource) {
+              spdlog::error(ErrCode::Value::ArgTypeMismatch);
+              spdlog::error("    Instance: Argument '{}' kind does not match "
+                            "the (eq) import"sv,
+                            ImportName);
+              spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Instance));
+              return Unexpect(ErrCode::Value::ArgTypeMismatch);
+            }
+            if (Tgt.IsResource && ArgIsResource && !Tgt.ImportName.empty()) {
+              auto It = ArgResourceIds.find(Tgt.ImportName);
+              if (It != ArgResourceIds.end() &&
+                  It->second.first != ArgRes->Id) {
+                spdlog::error(ErrCode::Value::ArgTypeMismatch);
+                spdlog::error("    Instance: Argument '{}' resource types are "
+                              "not the same"sv,
+                              ImportName);
+                spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Instance));
+                return Unexpect(ErrCode::Value::ArgTypeMismatch);
+              }
+            }
+          } else if (!ArgIsResource) {
+            spdlog::error(ErrCode::Value::ArgTypeMismatch);
+            spdlog::error(
+                "    Instance: Argument '{}' is not a resource type"sv,
+                ImportName);
+            spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Instance));
+            return Unexpect(ErrCode::Value::ArgTypeMismatch);
+          }
         }
+        if (ArgRes != nullptr) {
+          ArgResourceIds[ImportName] = {ArgRes->Id, ArgRes->LocallyDefined};
+        }
+      }
+      // Record an instance argument so a resource re-exported from it can
+      // inherit the argument instance's resource-export identity (GAP-I-3).
+      if (!Sort.isCore() &&
+          Sort.getSortType() == AST::Component::Sort::SortType::Instance) {
+        ArgInstanceIdx[ImportName] = Idx;
       }
       return {};
     };
@@ -1315,6 +1434,20 @@ Validator::validate(const AST::Component::Instance &Inst) noexcept {
                 if (It != ArgResourceIds.end()) {
                   ResourceId = It->second.first;
                   ResourceLocal = It->second.second;
+                }
+              }
+            } else if (!CR.InstImportName.empty()) {
+              // Resource re-exported from an imported instance: inherit the id
+              // from the instance argument's matching resource export
+              // (GAP-I-3).
+              auto It = ArgInstanceIdx.find(CR.InstImportName);
+              if (It != ArgInstanceIdx.end()) {
+                const auto &Exports = CompCtx.getInstance(It->second).Exports;
+                auto EIt = Exports.find(std::string(CR.InstExportName));
+                if (EIt != Exports.end() &&
+                    EIt->second.ResourceId.has_value()) {
+                  ResourceId = EIt->second.ResourceId;
+                  ResourceLocal = EIt->second.ResourceLocallyDefined;
                 }
               }
             }
