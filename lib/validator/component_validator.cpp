@@ -316,6 +316,48 @@ std::optional<uint32_t> borrowResource(const ComponentContext &Ctx,
   return std::nullopt;
 }
 
+// Resource type index of a ComponentValType that is directly own or borrow
+// (direct ComponentTypeCode or a TypeIndex to an own/borrow DefValType).
+std::optional<uint32_t>
+ownOrBorrowResource(const ComponentContext &Ctx,
+                    const ComponentValType &VT) noexcept {
+  if (VT.getCode() == ComponentTypeCode::Own ||
+      VT.getCode() == ComponentTypeCode::Borrow) {
+    return VT.getTypeIndex();
+  }
+  if (VT.getCode() == ComponentTypeCode::TypeIndex) {
+    const auto *DT = Ctx.getDefType(VT.getTypeIndex());
+    if (DT != nullptr && DT->isDefValType()) {
+      const auto &D = DT->getDefValType();
+      if (D.isOwnTy()) {
+        return D.getOwn().Idx;
+      }
+      if (D.isBorrowTy()) {
+        return D.getBorrow().Idx;
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+// Resource type indices directly referenced (own/borrow) by a function's
+// parameters and results.
+std::vector<uint32_t> funcResourceIndices(const ComponentContext &Ctx,
+                                          const AST::Component::FuncType &FT) {
+  std::vector<uint32_t> Out;
+  for (const auto &P : FT.getParamList()) {
+    if (auto R = ownOrBorrowResource(Ctx, P.getValType())) {
+      Out.push_back(*R);
+    }
+  }
+  for (const auto &R : FT.getResultList()) {
+    if (auto Ri = ownOrBorrowResource(Ctx, R.getValType())) {
+      Out.push_back(*Ri);
+    }
+  }
+  return Out;
+}
+
 // Validate that an annotated function ([constructor]/[method]) has the shape
 // the annotation requires (Explainer.md naming rules). The annotated resource
 // must already be resolvable as a kebab label in this scope.
@@ -2598,6 +2640,26 @@ Expect<void> Validator::validate(const AST::Component::Import &Im) noexcept {
                              ErrInfo::InfoAST(ASTNodeAttr::Comp_Import));
                          return E;
                        }));
+    }
+  }
+
+  // A function imported into this component may only reference resources that
+  // are importable (imported, hence not locally defined). Using a
+  // locally-defined resource in an import function is invalid.
+  if (Im.getDesc().getDescType() ==
+      AST::Component::ExternDesc::DescType::FuncType) {
+    const auto *DT = CompCtx.getDefType(Im.getDesc().getTypeIndex());
+    if (DT != nullptr && DT->isFuncType()) {
+      for (uint32_t RIdx : funcResourceIndices(CompCtx, DT->getFuncType())) {
+        const auto *RInfo = CompCtx.getResource(RIdx);
+        if (RInfo != nullptr && RInfo->LocallyDefined) {
+          spdlog::error(ErrCode::Value::InvalidTypeReference);
+          spdlog::error("    Import: function references a locally-defined "
+                        "resource and is not valid as an import"sv);
+          spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Import));
+          return Unexpect(ErrCode::Value::InvalidTypeReference);
+        }
+      }
     }
   }
 
