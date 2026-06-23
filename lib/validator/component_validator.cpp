@@ -816,6 +816,20 @@ Validator::validate(const AST::Component::AliasSection &AliasSec) noexcept {
       // scope so later own/borrow and (eq i) checks treat the slot correctly.
       if (IsOuter &&
           Sort.getSortType() == AST::Component::Sort::SortType::Type) {
+        // A concrete nested component (Ct >= 1, not a type-definition scope)
+        // may not alias an enclosing component's type that transitively
+        // references that component's generative resource — it would let the
+        // resource escape the component boundary (Explainer free-variable
+        // rule). Self-aliases (Ct == 0) and type-definition scopes are fine.
+        if (Alias.getOuter().first >= 1u && !CompCtx.isTypeDefinitionScope() &&
+            CompCtx.outerTypeRefsResource(Alias.getOuter().first,
+                                          Alias.getOuter().second)) {
+          spdlog::error(ErrCode::Value::InvalidTypeReference);
+          spdlog::error("    Alias: outer-aliased type references a resource "
+                        "not defined in the current component"sv);
+          spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Alias));
+          return Unexpect(ErrCode::Value::InvalidTypeReference);
+        }
         CompCtx.carryOuterResource(NewIdx, Alias.getOuter().first,
                                    Alias.getOuter().second);
       }

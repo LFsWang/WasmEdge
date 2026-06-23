@@ -439,6 +439,18 @@ public:
     }
   }
 
+  // Whether the type at SrcIdx in the scope Ct hops up transitively references
+  // a resource defined in that scope (own/borrow directly or nested in
+  // record/tuple/list/option/result/variant). Used to reject an outer alias
+  // that would let a resource escape an enclosing concrete component.
+  bool outerTypeRefsResource(uint32_t Ct, uint32_t SrcIdx) const noexcept {
+    const Context *O = resolveOuterContext(Ct);
+    if (O == nullptr) {
+      return false;
+    }
+    return defTypeRefsResourceIn(O, SrcIdx, 0);
+  }
+
   // ==========================================================================
   // instance
   // ==========================================================================
@@ -626,6 +638,75 @@ public:
   }
 
 private:
+  // Recursive helpers for outerTypeRefsResource (depth-guarded).
+  bool valTypeRefsResource(const Context *O, const ComponentValType &VT,
+                           unsigned Depth) const noexcept {
+    if (VT.getCode() == ComponentTypeCode::Own ||
+        VT.getCode() == ComponentTypeCode::Borrow) {
+      return O->Resources.find(VT.getTypeIndex()) != O->Resources.end();
+    }
+    if (VT.getCode() == ComponentTypeCode::TypeIndex) {
+      return defTypeRefsResourceIn(O, VT.getTypeIndex(), Depth + 1);
+    }
+    return false;
+  }
+  bool defValRefsResource(const Context *O, const AST::Component::DefValType &D,
+                          unsigned Depth) const noexcept {
+    if (D.isOwnTy()) {
+      return O->Resources.find(D.getOwn().Idx) != O->Resources.end();
+    }
+    if (D.isBorrowTy()) {
+      return O->Resources.find(D.getBorrow().Idx) != O->Resources.end();
+    }
+    if (D.isRecordTy()) {
+      for (const auto &F : D.getRecord().LabelTypes) {
+        if (valTypeRefsResource(O, F.getValType(), Depth)) {
+          return true;
+        }
+      }
+    } else if (D.isTupleTy()) {
+      for (const auto &T : D.getTuple().Types) {
+        if (valTypeRefsResource(O, T, Depth)) {
+          return true;
+        }
+      }
+    } else if (D.isListTy()) {
+      return valTypeRefsResource(O, D.getList().ValTy, Depth);
+    } else if (D.isOptionTy()) {
+      return valTypeRefsResource(O, D.getOption().ValTy, Depth);
+    } else if (D.isResultTy()) {
+      const auto &R = D.getResult();
+      if (R.ValTy.has_value() && valTypeRefsResource(O, *R.ValTy, Depth)) {
+        return true;
+      }
+      if (R.ErrTy.has_value() && valTypeRefsResource(O, *R.ErrTy, Depth)) {
+        return true;
+      }
+    } else if (D.isVariantTy()) {
+      for (const auto &C : D.getVariant().Cases) {
+        if (C.second.has_value() && valTypeRefsResource(O, *C.second, Depth)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+  bool defTypeRefsResourceIn(const Context *O, uint32_t Idx,
+                             unsigned Depth) const noexcept {
+    if (Depth > 16u || Idx >= O->Types.size()) {
+      return false;
+    }
+    if (O->Resources.find(Idx) != O->Resources.end()) {
+      return true; // the type at Idx is itself a resource
+    }
+    const auto *DT = O->Types[Idx];
+    if (DT != nullptr && DT->isDefValType()) {
+      return defValRefsResource(O, DT->getDefValType(), Depth);
+    }
+    // component / instance types: deep free-variable walk not yet implemented.
+    return false;
+  }
+
   uint32_t addTypeImpl(const AST::Component::DefType *DT,
                        bool IsLocal) noexcept {
     auto &Ctx = getCurrentContext();
