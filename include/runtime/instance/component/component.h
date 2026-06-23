@@ -19,6 +19,7 @@
 #include "common/errcode.h"
 #include "common/types.h"
 #include "runtime/instance/component/function.h"
+#include "runtime/instance/component/resource_table.h"
 #include "runtime/instance/module.h"
 #include "runtime/instance/tag.h"
 
@@ -374,11 +375,21 @@ public:
     return *CoreMods[Index];
   }
 
+  // Per-instance resource handle table (canonical ABI own/borrow handles and
+  // the resource.new/drop/rep built-ins). Mutable so the canonical ABI paths,
+  // which thread a `const ComponentInstance *`, can mutate the table.
+  Component::ResourceTable &getResourceTable() const noexcept {
+    return HandleTable;
+  }
+
 private:
   std::string CompName;
 
   // value
   std::vector<ComponentValVariant> ValueList;
+
+  // Resource handle table (see getResourceTable).
+  mutable Component::ResourceTable HandleTable;
 
   // Index spaces.
   // The index spaces of AST should be cleaned after instantiation.
