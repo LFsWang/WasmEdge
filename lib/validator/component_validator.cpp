@@ -531,15 +531,10 @@ resolveChildComponentFuncTypeIdx(const AST::Component::Component &Comp,
   return std::nullopt;
 }
 
-// Resolve a ComponentValType to the resource type index it owns, peeling
-// nested result<...> layers (a [constructor] may return (own R),
-// (result (own R)), (result (own R) (error E)), etc.).
-std::optional<uint32_t>
-ownResourceThroughResults(const ComponentContext &Ctx,
-                          const ComponentValType &VT) noexcept {
-  // own/borrow may be encoded directly (ComponentTypeCode::Own with the
-  // resource type index) or indirectly via a TypeIndex referencing a
-  // DefValType. Handle both, peeling result<...> layers in the indirect case.
+// Resolve a ComponentValType to the resource type index it directly owns
+// (direct ComponentTypeCode::Own or a TypeIndex to an own DefValType).
+std::optional<uint32_t> ownResource(const ComponentContext &Ctx,
+                                    const ComponentValType &VT) noexcept {
   if (VT.getCode() == ComponentTypeCode::Own) {
     return VT.getTypeIndex();
   }
@@ -554,8 +549,28 @@ ownResourceThroughResults(const ComponentContext &Ctx,
   if (D.isOwnTy()) {
     return D.getOwn().Idx;
   }
+  return std::nullopt;
+}
+
+// Resolve a [constructor] result type to the resource it owns. The spec allows
+// exactly `(own $R)` or a single `(result (own $R) E?)` layer (Binary.md /
+// Explainer.md) — no deeper nesting — so peel at most one result.
+std::optional<uint32_t>
+ownResourceThroughResults(const ComponentContext &Ctx,
+                          const ComponentValType &VT) noexcept {
+  if (auto Direct = ownResource(Ctx, VT)) {
+    return Direct;
+  }
+  if (VT.getCode() != ComponentTypeCode::TypeIndex) {
+    return std::nullopt;
+  }
+  const auto *DT = Ctx.getDefType(VT.getTypeIndex());
+  if (DT == nullptr || !DT->isDefValType()) {
+    return std::nullopt;
+  }
+  const auto &D = DT->getDefValType();
   if (D.isResultTy() && D.getResult().ValTy.has_value()) {
-    return ownResourceThroughResults(Ctx, *D.getResult().ValTy);
+    return ownResource(Ctx, *D.getResult().ValTy);
   }
   return std::nullopt;
 }
