@@ -81,8 +81,9 @@ public:
       bool LocallyDefined = false;
     };
     // Export of a core:instance. Kind is always set; Mem is populated for
-    // memory exports so instantiation can subtype-check the index type
-    // (GAP-CI-1).
+    // memory exports (index-type subtype checks, GAP-CI-1); Func is populated
+    // for function exports so an `alias core export` can carry the func type
+    // (e.g. resource destructor signature validation).
     struct CoreInstanceExport {
       ExternalType Kind;
       // Stored by value (not pointer): the module-type descriptor getter
@@ -92,13 +93,18 @@ public:
       std::optional<AST::MemoryType> Mem;
       std::optional<AST::TableType> Tab;
       std::optional<AST::GlobalType> Glob;
+      // Func type for function exports, so an `alias core export` can carry the
+      // func type (e.g. resource destructor signature validation). The SubType
+      // is owned by the core type sort space, so a pointer stays valid here.
+      const AST::SubType *Func = nullptr;
 
       CoreInstanceExport() noexcept = default;
-      // Copies whichever core extern type is provided (the others stay empty).
+      // Copies whichever core extern type is provided (the others stay empty);
+      // Func is a stable pointer and stored as-is.
       CoreInstanceExport(ExternalType K, const AST::MemoryType *M,
-                         const AST::TableType *T,
-                         const AST::GlobalType *G) noexcept
-          : Kind(K) {
+                         const AST::TableType *T, const AST::GlobalType *G,
+                         const AST::SubType *F = nullptr) noexcept
+          : Kind(K), Func(F) {
         if (M != nullptr) {
           Mem = *M;
         }
@@ -294,9 +300,10 @@ public:
                              ExternalType ET,
                              const AST::MemoryType *Mem = nullptr,
                              const AST::TableType *Tab = nullptr,
-                             const AST::GlobalType *Glob = nullptr) {
+                             const AST::GlobalType *Glob = nullptr,
+                             const AST::SubType *Func = nullptr) {
     getCurrentContext().CoreInstances.at(InstIdx)[std::string(Name)] =
-        Context::CoreInstanceExport{ET, Mem, Tab, Glob};
+        Context::CoreInstanceExport{ET, Mem, Tab, Glob, Func};
   }
 
   // ==========================================================================

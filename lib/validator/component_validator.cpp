@@ -779,10 +779,10 @@ Validator::validate(const AST::Component::AliasSection &AliasSec) noexcept {
       // For an `alias core export` of a memory, carry the source memory's type
       // into the core-memory sort space so canonical options can subtype-check
       // its index type later (GAP-CI-1).
-      if (Alias.getTargetType() ==
-              AST::Component::Alias::TargetType::CoreExport &&
-          Sort.getCoreSortType() ==
-              AST::Component::Sort::CoreSortType::Memory) {
+      const bool IsCoreExport = Alias.getTargetType() ==
+                                AST::Component::Alias::TargetType::CoreExport;
+      if (IsCoreExport && Sort.getCoreSortType() ==
+                              AST::Component::Sort::CoreSortType::Memory) {
         std::optional<AST::MemoryType> SrcMem;
         const auto SrcIdx = Alias.getExport().first;
         if (SrcIdx < CompCtx.getCoreSortIndexSize(
@@ -794,6 +794,21 @@ Validator::validate(const AST::Component::AliasSection &AliasSec) noexcept {
           }
         }
         NewCoreIdx = CompCtx.addCoreMemory(std::move(SrcMem));
+      } else if (IsCoreExport && Sort.getCoreSortType() ==
+                                     AST::Component::Sort::CoreSortType::Func) {
+        // Carry the source func's type so signature checks (e.g. a resource
+        // destructor) can see it through the alias.
+        const AST::SubType *SrcFunc = nullptr;
+        const auto SrcIdx = Alias.getExport().first;
+        if (SrcIdx < CompCtx.getCoreSortIndexSize(
+                         AST::Component::Sort::CoreSortType::Instance)) {
+          const auto &Exports = CompCtx.getCoreInstance(SrcIdx);
+          const auto It = Exports.find(std::string(Alias.getExport().second));
+          if (It != Exports.end()) {
+            SrcFunc = It->second.Func;
+          }
+        }
+        NewCoreIdx = CompCtx.addCoreFunc(SrcFunc);
       } else {
         NewCoreIdx = CompCtx.incCoreSortIndexSize(Sort.getCoreSortType());
       }
@@ -1196,10 +1211,39 @@ Validator::validate(const AST::Component::CoreInstance &Inst) noexcept {
     // Allocate the core:instance and bind exports to it.
     uint32_t InstanceIdx = CompCtx.addCoreInstance();
     if (Mod != nullptr) {
+      // Resolve a core module export func index to its SubType (imports then
+      // function section, via the type section), so an alias-core-export can
+      // carry the func signature (e.g. a resource destructor).
+      auto ResolveFuncType = [](const AST::Module &M,
+                                uint32_t FuncIdx) -> const AST::SubType * {
+        const auto &Types = M.getTypeSection().getContent();
+        uint32_t ImpCount = 0;
+        for (const auto &Imp : M.getImportSection().getContent()) {
+          if (Imp.getExternalType() != ExternalType::Function) {
+            continue;
+          }
+          if (ImpCount == FuncIdx) {
+            const uint32_t TI = Imp.getExternalFuncTypeIdx();
+            return TI < Types.size() ? &Types[TI] : nullptr;
+          }
+          ++ImpCount;
+        }
+        const auto &FuncSec = M.getFunctionSection().getContent();
+        const uint32_t Local = FuncIdx - ImpCount;
+        if (Local < FuncSec.size()) {
+          const uint32_t TI = FuncSec[Local];
+          return TI < Types.size() ? &Types[TI] : nullptr;
+        }
+        return nullptr;
+      };
       for (const auto &ExportDesc : Mod->getExportSection().getContent()) {
         // Resolve the memory type so re-exports carry their index type for
         // later instantiation subtype checks (GAP-CI-1).
         const AST::MemoryType *MemTy = nullptr;
+        const AST::SubType *FuncTy = nullptr;
+        if (ExportDesc.getExternalType() == ExternalType::Function) {
+          FuncTy = ResolveFuncType(*Mod, ExportDesc.getExternalIndex());
+        }
         if (ExportDesc.getExternalType() == ExternalType::Memory) {
           const uint32_t Target = ExportDesc.getExternalIndex();
           uint32_t MemImpCount = 0;
@@ -1222,7 +1266,8 @@ Validator::validate(const AST::Component::CoreInstance &Inst) noexcept {
           }
         }
         CompCtx.addCoreInstanceExport(InstanceIdx, ExportDesc.getExternalName(),
-                                      ExportDesc.getExternalType(), MemTy);
+                                      ExportDesc.getExternalType(), MemTy,
+                                      /*Tab=*/nullptr, /*Glob=*/nullptr, FuncTy);
       }
     } else if (ModTy != nullptr && ModTy->isModuleType()) {
       for (const auto &Decl : ModTy->getModuleType()) {
