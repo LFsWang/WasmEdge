@@ -76,6 +76,10 @@ public:
     struct InstanceSlot {
       std::unordered_map<std::string, InstanceExport> Exports;
       const AST::Component::InstanceType *Type;
+      // True when this instance is import-rooted (an instance import or an
+      // alias-export off an import-rooted instance), so a resource surfaced out
+      // of it is importable by a function import in this component.
+      bool FromImport = false;
       InstanceSlot() : Type(nullptr) {}
       InstanceSlot(const AST::Component::InstanceType *T) : Type(T) {}
     };
@@ -507,6 +511,14 @@ public:
   /// `.Type` (externdesc-bound InstanceType) as needed.
   const Context::InstanceSlot &getInstance(uint32_t Idx) const noexcept {
     return getCurrentContext().Instances.at(Idx);
+  }
+
+  /// Mark / query whether an instance slot is import-rooted (see InstanceSlot).
+  void setInstanceFromImport(uint32_t Idx) noexcept {
+    getCurrentContext().Instances.at(Idx).FromImport = true;
+  }
+  bool isInstanceFromImport(uint32_t Idx) const noexcept {
+    return getCurrentContext().Instances.at(Idx).FromImport;
   }
 
   void addInstanceExport(uint32_t InstIdx, std::string_view Name,

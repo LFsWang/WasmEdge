@@ -214,6 +214,21 @@ resolveChildInstanceProvenance(const AST::Component::Component &Comp,
           CurrentIdx++;
         }
       }
+    } else if (const auto *ESec =
+                   std::get_if<AST::Component::ExportSection>(&Sec)) {
+      // An instance-sort export re-exports an existing instance and introduces
+      // a new instance index, so follow it to keep the index space aligned.
+      for (const auto &Ex : ESec->getContent()) {
+        const auto &S = Ex.getSortIndex().getSort();
+        if (!S.isCore() &&
+            S.getSortType() == AST::Component::Sort::SortType::Instance) {
+          if (CurrentIdx == InstIdx) {
+            return resolveChildInstanceProvenance(
+                Comp, Ex.getSortIndex().getIdx(), Depth + 1);
+          }
+          CurrentIdx++;
+        }
+      }
     }
   }
   return {};
@@ -221,10 +236,13 @@ resolveChildInstanceProvenance(const AST::Component::Component &Comp,
 
 // Map a child component instance index to the name of the instance IMPORT at
 // that index, or empty if the index is not an instance import. The instance
-// index space is: instance imports + instance definitions + instance aliases,
-// in section order.
+// index space is: instance imports + instance definitions + instance aliases +
+// instance exports, in section order.
 std::string_view childInstanceImportName(const AST::Component::Component &Comp,
-                                         uint32_t InstIdx) {
+                                         uint32_t InstIdx, unsigned Depth = 0) {
+  if (Depth > 32u) {
+    return {};
+  }
   uint32_t CurrentIdx = 0;
   for (const auto &Sec : Comp.getSections()) {
     if (std::holds_alternative<AST::Component::ImportSection>(Sec)) {
@@ -258,16 +276,33 @@ std::string_view childInstanceImportName(const AST::Component::Component &Comp,
           CurrentIdx++;
         }
       }
+    } else if (std::holds_alternative<AST::Component::ExportSection>(Sec)) {
+      const auto &ESec = std::get<AST::Component::ExportSection>(Sec);
+      for (const auto &Ex : ESec.getContent()) {
+        const auto &S = Ex.getSortIndex().getSort();
+        if (!S.isCore() &&
+            S.getSortType() == AST::Component::Sort::SortType::Instance) {
+          if (CurrentIdx == InstIdx) {
+            // Re-export of an instance: resolve the underlying import name.
+            return childInstanceImportName(Comp, Ex.getSortIndex().getIdx(),
+                                           Depth + 1);
+          }
+          CurrentIdx++;
+        }
+      }
     }
   }
   return {};
 }
 
 // Walk the child component's type index space (type sections + type-bound
-// imports + type aliases, in section order, mirroring resolveChildInstanceType)
-// and classify the type at TypeIdx.
+// imports + type aliases + type exports, in section order, mirroring
+// resolveChildInstanceType) and classify the type at TypeIdx.
 ChildResourceInfo resolveChildResource(const AST::Component::Component &Comp,
-                                       uint32_t TypeIdx) {
+                                       uint32_t TypeIdx, unsigned Depth = 0) {
+  if (Depth > 32u) {
+    return {};
+  }
   uint32_t CurrentIdx = 0;
   for (const auto &Sec : Comp.getSections()) {
     if (std::holds_alternative<AST::Component::TypeSection>(Sec)) {
@@ -326,6 +361,20 @@ ChildResourceInfo resolveChildResource(const AST::Component::Component &Comp,
           CurrentIdx++;
         }
       }
+    } else if (std::holds_alternative<AST::Component::ExportSection>(Sec)) {
+      const auto &ESec = std::get<AST::Component::ExportSection>(Sec);
+      for (const auto &Ex : ESec.getContent()) {
+        const auto &S = Ex.getSortIndex().getSort();
+        if (!S.isCore() &&
+            S.getSortType() == AST::Component::Sort::SortType::Type) {
+          if (CurrentIdx == TypeIdx) {
+            // An export-of-type re-exports an existing type; follow it.
+            return resolveChildResource(Comp, Ex.getSortIndex().getIdx(),
+                                        Depth + 1);
+          }
+          CurrentIdx++;
+        }
+      }
     }
   }
   return {};
@@ -335,7 +384,11 @@ ChildResourceInfo resolveChildResource(const AST::Component::Component &Comp,
 // entries only; imports/aliases have no inline body), mirroring the type index
 // space of resolveChildResource.
 const AST::Component::DefType *
-resolveChildDefType(const AST::Component::Component &Comp, uint32_t TypeIdx) {
+resolveChildDefType(const AST::Component::Component &Comp, uint32_t TypeIdx,
+                    unsigned Depth = 0) {
+  if (Depth > 32u) {
+    return nullptr;
+  }
   uint32_t CurrentIdx = 0;
   for (const auto &Sec : Comp.getSections()) {
     if (std::holds_alternative<AST::Component::TypeSection>(Sec)) {
@@ -365,6 +418,21 @@ resolveChildDefType(const AST::Component::Component &Comp, uint32_t TypeIdx) {
                 AST::Component::Sort::SortType::Type) {
           if (CurrentIdx == TypeIdx) {
             return nullptr;
+          }
+          CurrentIdx++;
+        }
+      }
+    } else if (std::holds_alternative<AST::Component::ExportSection>(Sec)) {
+      const auto &ESec = std::get<AST::Component::ExportSection>(Sec);
+      for (const auto &Ex : ESec.getContent()) {
+        const auto &S = Ex.getSortIndex().getSort();
+        if (!S.isCore() &&
+            S.getSortType() == AST::Component::Sort::SortType::Type) {
+          if (CurrentIdx == TypeIdx) {
+            // An export-of-type has no inline body; follow it to the underlying
+            // type, which may be a type-section entry with a body.
+            return resolveChildDefType(Comp, Ex.getSortIndex().getIdx(),
+                                       Depth + 1);
           }
           CurrentIdx++;
         }
@@ -487,11 +555,14 @@ childValTypeResourceTS(const std::vector<ChildTSEntry> &TS,
 }
 
 // Resolve a child component's func index to the component func type index it
-// declares (function imports, then canon lift entries; aliased funcs are not
-// resolved here).
+// declares (function imports, then canon lift entries, then func exports;
+// aliased funcs are not resolved here).
 std::optional<uint32_t>
 resolveChildComponentFuncTypeIdx(const AST::Component::Component &Comp,
-                                 uint32_t FuncIdx) {
+                                 uint32_t FuncIdx, unsigned Depth = 0) {
+  if (Depth > 32u) {
+    return std::nullopt;
+  }
   uint32_t Cur = 0;
   for (const auto &Sec : Comp.getSections()) {
     if (const auto *I = std::get_if<AST::Component::ImportSection>(&Sec)) {
@@ -522,6 +593,20 @@ resolveChildComponentFuncTypeIdx(const AST::Component::Component &Comp,
                 AST::Component::Sort::SortType::Func) {
           if (Cur == FuncIdx) {
             return std::nullopt;
+          }
+          ++Cur;
+        }
+      }
+    } else if (const auto *E =
+                   std::get_if<AST::Component::ExportSection>(&Sec)) {
+      for (const auto &Ex : E->getContent()) {
+        const auto &S = Ex.getSortIndex().getSort();
+        if (!S.isCore() &&
+            S.getSortType() == AST::Component::Sort::SortType::Func) {
+          if (Cur == FuncIdx) {
+            // A func export re-exports an existing func; follow it.
+            return resolveChildComponentFuncTypeIdx(
+                Comp, Ex.getSortIndex().getIdx(), Depth + 1);
           }
           ++Cur;
         }
@@ -1233,7 +1318,13 @@ Validator::validate(const AST::Component::AliasSection &AliasSec) noexcept {
         const auto &SrcExports = CompCtx.getInstance(SrcInstIdx).Exports;
         auto It = SrcExports.find(std::string(SrcName));
         if (It != SrcExports.end()) {
+          // An alias-export off an import-rooted instance is itself
+          // import-rooted, so resources surfaced through it stay importable.
+          const bool SrcFromImport = CompCtx.isInstanceFromImport(SrcInstIdx);
           if (Sort.getSortType() == AST::Component::Sort::SortType::Instance) {
+            if (SrcFromImport) {
+              CompCtx.setInstanceFromImport(NewIdx);
+            }
             if (It->second.IT != nullptr) {
               populateInstanceFromType(NewIdx, *It->second.IT);
             } else if (It->second.NestedInstIdx.has_value()) {
@@ -1256,6 +1347,12 @@ Validator::validate(const AST::Component::AliasSection &AliasSec) noexcept {
             // context (resources.wast "imports aren't transitive").
             CompCtx.addResource(NewIdx, {*It->second.ResourceId,
                                          It->second.ResourceLocallyDefined});
+            // Surfacing a resource out of an import-rooted instance makes it
+            // importable, so a function import in this component may reference
+            // it (its id is only allocated here, when the instance is aliased).
+            if (SrcFromImport) {
+              CompCtx.markResourceImportable(*It->second.ResourceId);
+            }
           } else if (Sort.getSortType() ==
                          AST::Component::Sort::SortType::Func &&
                      It->second.HasFuncSig) {
@@ -1384,6 +1481,45 @@ Validator::validate(const AST::Component::ImportSection &ImpSec) noexcept {
 
 Expect<void>
 Validator::validate(const AST::Component::ExportSection &ExpSec) noexcept {
+  // Pre-pass: mark every resource that this section exports (directly as a type
+  // or transitively through an exported instance) before validating individual
+  // exports. The per-export func nameability check (validate(Export)) consults
+  // the exported-resource set, and the set must not depend on whether a func
+  // export precedes or follows the resource export it references — the spec
+  // treats all of a component's exports as simultaneously in scope.
+  const uint32_t InstSpaceSize =
+      CompCtx.getSortIndexSize(AST::Component::Sort::SortType::Instance);
+  for (const auto &Exp : ExpSec.getContent()) {
+    const auto &Sort = Exp.getSortIndex().getSort();
+    if (Sort.isCore()) {
+      continue;
+    }
+    const uint32_t SrcIdx = Exp.getSortIndex().getIdx();
+    if (Sort.getSortType() == AST::Component::Sort::SortType::Type) {
+      if (const auto *RInfo = CompCtx.getResource(SrcIdx)) {
+        CompCtx.markResourceExported(RInfo->Id);
+      }
+    } else if (Sort.getSortType() == AST::Component::Sort::SortType::Instance &&
+               SrcIdx < InstSpaceSize) {
+      std::vector<uint32_t> WL{SrcIdx};
+      std::unordered_set<uint32_t> Seen;
+      while (!WL.empty()) {
+        const uint32_t Cur = WL.back();
+        WL.pop_back();
+        if (!Seen.insert(Cur).second) {
+          continue;
+        }
+        for (const auto &[Name, IE] : CompCtx.getInstance(Cur).Exports) {
+          if (IE.ResourceId.has_value()) {
+            CompCtx.markResourceExported(*IE.ResourceId);
+          }
+          if (IE.NestedInstIdx.has_value()) {
+            WL.push_back(*IE.NestedInstIdx);
+          }
+        }
+      }
+    }
+  }
   for (const auto &Exp : ExpSec.getContent()) {
     EXPECTED_TRY(validate(Exp).map_error([](auto E) {
       spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Sec_Export));
@@ -3283,6 +3419,11 @@ Expect<void> Validator::validate(const AST::Component::Import &Im) noexcept {
     }
   } else if (Im.getDesc().getDescType() ==
              AST::Component::ExternDesc::DescType::InstanceType) {
+    // The imported instance is import-rooted: mark its provenance so a resource
+    // later surfaced out of it (including through nested instance-of-instance
+    // exports, whose ids are only allocated when alias-exported) is recorded as
+    // importable, and mark its directly-exported resources now.
+    CompCtx.setInstanceFromImport(InstSpaceBefore);
     for (const auto &[Name, IE] :
          CompCtx.getInstance(InstSpaceBefore).Exports) {
       if (IE.ResourceId.has_value()) {
@@ -3813,6 +3954,9 @@ Validator::validate(const AST::Component::ImportDecl &Decl) noexcept {
     }
   } else if (Decl.getExternDesc().getDescType() ==
              AST::Component::ExternDesc::DescType::InstanceType) {
+    // Mark import provenance + directly-exported resources (see
+    // validate(Import)).
+    CompCtx.setInstanceFromImport(InstSpaceBefore);
     for (const auto &[Name, IE] :
          CompCtx.getInstance(InstSpaceBefore).Exports) {
       if (IE.ResourceId.has_value()) {
