@@ -708,6 +708,29 @@ private:
     }
     return false;
   }
+  // True if an `alias outer` declaration inside a type body (whose defining
+  // scope is O) targets a resource in the scope it reaches. From inside the
+  // body, Ct == 1 reaches O, Ct == 2 reaches O's parent, and so on.
+  bool aliasOuterHitsResource(const Context *O,
+                              const AST::Component::Alias &A) const noexcept {
+    if (A.getTargetType() != AST::Component::Alias::TargetType::Outer) {
+      return false;
+    }
+    if (A.getSort().isCore() ||
+        A.getSort().getSortType() != AST::Component::Sort::SortType::Type) {
+      return false;
+    }
+    const uint32_t Ct = A.getOuter().first;
+    const uint32_t Idx = A.getOuter().second;
+    if (Ct < 1u) {
+      return false; // self-reference within the type body
+    }
+    const Context *R = O;
+    for (uint32_t H = 1u; H < Ct && R != nullptr; ++H) {
+      R = R->Parent;
+    }
+    return R != nullptr && R->Resources.find(Idx) != R->Resources.end();
+  }
   bool defTypeRefsResourceIn(const Context *O, uint32_t Idx,
                              unsigned Depth) const noexcept {
     if (Depth > 16u || Idx >= O->Types.size()) {
@@ -717,10 +740,28 @@ private:
       return true; // the type at Idx is itself a resource
     }
     const auto *DT = O->Types[Idx];
-    if (DT != nullptr && DT->isDefValType()) {
+    if (DT == nullptr) {
+      return false;
+    }
+    if (DT->isDefValType()) {
       return defValRefsResource(O, DT->getDefValType(), Depth);
     }
-    // component / instance types: deep free-variable walk not yet implemented.
+    // Component / instance types reference a resource if a declaration outer-
+    // aliases one from an enclosing scope (Explainer free-variable rule).
+    if (DT->isComponentType()) {
+      for (const auto &CD : DT->getComponentType().getDecl()) {
+        if (CD.isInstanceDecl() && CD.getInstance().isAlias() &&
+            aliasOuterHitsResource(O, CD.getInstance().getAlias())) {
+          return true;
+        }
+      }
+    } else if (DT->isInstanceType()) {
+      for (const auto &ID : DT->getInstanceType().getDecl()) {
+        if (ID.isAlias() && aliasOuterHitsResource(O, ID.getAlias())) {
+          return true;
+        }
+      }
+    }
     return false;
   }
 
