@@ -2939,6 +2939,22 @@ Expect<void> Validator::validate(const AST::Component::Export &Ex) noexcept {
                                     IE.ResourceLocallyDefined);
         }
       }
+      // Resources surfaced by an exported instance (including nested
+      // instance-of-instance exports) are exported too, so a function exported
+      // from this component may reference them.
+      std::vector<uint32_t> WL{NewIdx};
+      while (!WL.empty()) {
+        const uint32_t Cur = WL.back();
+        WL.pop_back();
+        for (const auto &[Name, IE] : CompCtx.getInstance(Cur).Exports) {
+          if (IE.ResourceId.has_value()) {
+            CompCtx.markResourceExported(*IE.ResourceId);
+          }
+          if (IE.NestedInstIdx.has_value()) {
+            WL.push_back(*IE.NestedInstIdx);
+          }
+        }
+      }
     } else if (Sort.getSortType() == AST::Component::Sort::SortType::Type) {
       // Exporting a resource type introduces a new type index aliasing the
       // resource. Propagate the resource identity so own / borrow and
@@ -2947,8 +2963,37 @@ Expect<void> Validator::validate(const AST::Component::Export &Ex) noexcept {
       // [static]) can reference it.
       if (const auto *RInfo = CompCtx.getResource(Idx)) {
         CompCtx.addResource(NewIdx, {RInfo->Id, RInfo->LocallyDefined});
+        CompCtx.markResourceExported(RInfo->Id);
         if (CName.getKind() == ComponentNameKind::Label) {
           CompCtx.addResourceLabel(Ex.getName(), NewIdx);
+        }
+      }
+    } else if (Sort.getSortType() == AST::Component::Sort::SortType::Func) {
+      // A function exported from this component must have its resources named
+      // in the export context: a plain export may use imported or exported
+      // resources but not a locally-defined unexported one; an annotated
+      // export ([constructor]/[method]/[static]) requires the resource to be
+      // exported (it must be nameable by the annotation in this context).
+      const bool Annotated =
+          CName.getKind() == ComponentNameKind::Constructor ||
+          CName.getKind() == ComponentNameKind::Method ||
+          CName.getKind() == ComponentNameKind::Static;
+      if (const auto *FT = CompCtx.getFunc(Idx)) {
+        for (uint32_t RIdx : funcResourceIndices(CompCtx, *FT)) {
+          const auto *RInfo = CompCtx.getResource(RIdx);
+          if (RInfo == nullptr) {
+            continue;
+          }
+          const bool Exported = CompCtx.isResourceExported(RInfo->Id);
+          const bool Bad =
+              Annotated ? !Exported : (RInfo->LocallyDefined && !Exported);
+          if (Bad) {
+            spdlog::error(ErrCode::Value::InvalidTypeReference);
+            spdlog::error("    Export: function references a resource with no "
+                          "name in the export context"sv);
+            spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Export));
+            return Unexpect(ErrCode::Value::InvalidTypeReference);
+          }
         }
       }
     }

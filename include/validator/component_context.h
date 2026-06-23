@@ -148,6 +148,9 @@ public:
 
     // ---- Resource state (keyed by type index) ----
     std::unordered_map<uint32_t, ResourceInfo> Resources;
+    // Resource ids exported from this component (directly or via an exported
+    // instance), so a function exported from here may reference them.
+    std::unordered_set<uint64_t> ExportedResourceIds;
 
     // ---- Validation state ----
     std::unordered_map<std::string, uint32_t> TypeSubstitutions;
@@ -517,6 +520,16 @@ public:
     const auto &R = getCurrentContext().Resources;
     auto It = R.find(Idx);
     return It != R.end() ? &It->second : nullptr;
+  }
+
+  /// Mark / query a resource (by canonical id) as exported from this
+  /// component, so an exported function may reference it.
+  void markResourceExported(uint64_t Id) noexcept {
+    getCurrentContext().ExportedResourceIds.insert(Id);
+  }
+  bool isResourceExported(uint64_t Id) const noexcept {
+    const auto &S = getCurrentContext().ExportedResourceIds;
+    return S.find(Id) != S.end();
   }
 
   /// Register a kebab-case resource name (from a TypeBound import / export)
