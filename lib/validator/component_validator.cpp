@@ -875,12 +875,12 @@ Validator::validate(const AST::Component::AliasSection &AliasSec) noexcept {
                      It->second.ResourceId.has_value()) {
             // Alias-export of a resource type — same identity (and locality, so
             // resource.new/.rep on a re-surfaced local resource still pass).
-            // Register the export's kebab name as a resource label too so
-            // annotated names ([method]/[constructor]/[static]) can reference a
-            // resource surfaced from an instance.
+            // The kebab name is NOT registered as a resource label: a resource
+            // surfaced transitively from an instance does not have a name for
+            // annotated functions ([method]/[constructor]/[static]) in this
+            // context (resources.wast "imports aren't transitive").
             CompCtx.addResource(NewIdx, {*It->second.ResourceId,
                                          It->second.ResourceLocallyDefined});
-            CompCtx.addResourceLabel(std::string(SrcName), NewIdx);
           }
         }
       }
