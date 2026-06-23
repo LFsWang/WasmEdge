@@ -138,6 +138,183 @@ resolveChildInstanceType(const AST::Component::Component &Comp,
   return nullptr;
 }
 
+// Result of resolving a type index inside a child component's type space to a
+// resource. Used when instantiating a component to give the resulting instance
+// exports the right resource identity: a resource the child DEFINES is
+// generative (fresh id per instantiation); a resource the child IMPORTS and
+// re-exports inherits the id of the instantiation argument bound to ImportName.
+struct ChildResourceInfo {
+  bool IsResource = false;
+  bool LocallyDefined = false;
+  std::string_view ImportName; // set when the resource is an imported type
+};
+
+// Walk the child component's type index space (type sections + type-bound
+// imports + type aliases, in section order, mirroring resolveChildInstanceType)
+// and classify the type at TypeIdx.
+ChildResourceInfo resolveChildResource(const AST::Component::Component &Comp,
+                                       uint32_t TypeIdx) {
+  uint32_t CurrentIdx = 0;
+  for (const auto &Sec : Comp.getSections()) {
+    if (std::holds_alternative<AST::Component::TypeSection>(Sec)) {
+      const auto &TSec = std::get<AST::Component::TypeSection>(Sec);
+      for (const auto &DT : TSec.getContent()) {
+        if (CurrentIdx == TypeIdx) {
+          return {
+              DT.isResourceType(), /*LocallyDefined=*/DT.isResourceType(), {}};
+        }
+        CurrentIdx++;
+      }
+    } else if (std::holds_alternative<AST::Component::ImportSection>(Sec)) {
+      const auto &ISec = std::get<AST::Component::ImportSection>(Sec);
+      for (const auto &Import : ISec.getContent()) {
+        if (Import.getDesc().getDescType() ==
+            AST::Component::ExternDesc::DescType::TypeBound) {
+          if (CurrentIdx == TypeIdx) {
+            // `(sub resource)` is a resource import; `(eq i)` aliases type i.
+            const bool IsRes = !Import.getDesc().isEqType();
+            return {IsRes, /*LocallyDefined=*/false,
+                    IsRes ? Import.getName() : std::string_view{}};
+          }
+          CurrentIdx++;
+        }
+      }
+    } else if (std::holds_alternative<AST::Component::AliasSection>(Sec)) {
+      const auto &ASec = std::get<AST::Component::AliasSection>(Sec);
+      for (const auto &Alias : ASec.getContent()) {
+        if (!Alias.getSort().isCore() &&
+            Alias.getSort().getSortType() ==
+                AST::Component::Sort::SortType::Type) {
+          if (CurrentIdx == TypeIdx) {
+            return {}; // alias chain not resolved here (best-effort)
+          }
+          CurrentIdx++;
+        }
+      }
+    }
+  }
+  return {};
+}
+
+// Resolve a ComponentValType to the resource type index it owns, peeling
+// nested result<...> layers (a [constructor] may return (own R),
+// (result (own R)), (result (own R) (error E)), etc.).
+std::optional<uint32_t>
+ownResourceThroughResults(const ComponentContext &Ctx,
+                          const ComponentValType &VT) noexcept {
+  // own/borrow may be encoded directly (ComponentTypeCode::Own with the
+  // resource type index) or indirectly via a TypeIndex referencing a
+  // DefValType. Handle both, peeling result<...> layers in the indirect case.
+  if (VT.getCode() == ComponentTypeCode::Own) {
+    return VT.getTypeIndex();
+  }
+  if (VT.getCode() != ComponentTypeCode::TypeIndex) {
+    return std::nullopt;
+  }
+  const auto *DT = Ctx.getDefType(VT.getTypeIndex());
+  if (DT == nullptr || !DT->isDefValType()) {
+    return std::nullopt;
+  }
+  const auto &D = DT->getDefValType();
+  if (D.isOwnTy()) {
+    return D.getOwn().Idx;
+  }
+  if (D.isResultTy() && D.getResult().ValTy.has_value()) {
+    return ownResourceThroughResults(Ctx, *D.getResult().ValTy);
+  }
+  return std::nullopt;
+}
+
+// Resolve a ComponentValType to the resource type index it borrows (direct
+// ComponentTypeCode::Borrow encoding or a TypeIndex to a borrow DefValType).
+std::optional<uint32_t> borrowResource(const ComponentContext &Ctx,
+                                       const ComponentValType &VT) noexcept {
+  if (VT.getCode() == ComponentTypeCode::Borrow) {
+    return VT.getTypeIndex();
+  }
+  if (VT.getCode() != ComponentTypeCode::TypeIndex) {
+    return std::nullopt;
+  }
+  const auto *DT = Ctx.getDefType(VT.getTypeIndex());
+  if (DT == nullptr || !DT->isDefValType()) {
+    return std::nullopt;
+  }
+  const auto &D = DT->getDefValType();
+  if (D.isBorrowTy()) {
+    return D.getBorrow().Idx;
+  }
+  return std::nullopt;
+}
+
+// Validate that an annotated function ([constructor]/[method]) has the shape
+// the annotation requires (Explainer.md naming rules). The annotated resource
+// must already be resolvable as a kebab label in this scope.
+Expect<void>
+validateAnnotatedFuncSig(const ComponentContext &Ctx,
+                         const ComponentName &CName,
+                         const AST::Component::FuncType &FT) noexcept {
+  auto wantId = [&](std::string_view Label) -> std::optional<uint64_t> {
+    if (auto Idx = Ctx.getResourceLabel(Label)) {
+      if (const auto *R = Ctx.getResource(*Idx)) {
+        return R->Id;
+      }
+    }
+    return std::nullopt;
+  };
+  auto resId = [&](uint32_t TypeIdx) -> std::optional<uint64_t> {
+    if (const auto *R = Ctx.getResource(TypeIdx)) {
+      return R->Id;
+    }
+    return std::nullopt;
+  };
+  if (CName.getKind() == ComponentNameKind::Constructor) {
+    const auto Want = wantId(CName.getDetail().get<ConstructorDetail>().Label);
+    const auto &Res = FT.getResultList();
+    if (Res.size() != 1) {
+      spdlog::error(ErrCode::Value::ComponentCtorReturnOne);
+      spdlog::error("    [constructor] must return exactly one value"sv);
+      return Unexpect(ErrCode::Value::ComponentCtorReturnOne);
+    }
+    const auto OwnIdx = ownResourceThroughResults(Ctx, Res[0].getValType());
+    if (!OwnIdx.has_value()) {
+      spdlog::error(ErrCode::Value::ComponentCtorReturnOwnOrResult);
+      spdlog::error(
+          "    [constructor] must return (own $T) or (result (own $T))"sv);
+      return Unexpect(ErrCode::Value::ComponentCtorReturnOwnOrResult);
+    }
+    if (Want.has_value() && resId(*OwnIdx) != Want) {
+      spdlog::error(ErrCode::Value::ComponentCtorResourceMismatch);
+      spdlog::error("    [constructor] result resource does not match name"sv);
+      return Unexpect(ErrCode::Value::ComponentCtorResourceMismatch);
+    }
+  } else if (CName.getKind() == ComponentNameKind::Method) {
+    const auto Want = wantId(CName.getDetail().get<MethodDetail>().Resource);
+    const auto &Par = FT.getParamList();
+    if (Par.empty()) {
+      spdlog::error(ErrCode::Value::ComponentMethodNeedsArg);
+      spdlog::error("    [method] must take at least one argument"sv);
+      return Unexpect(ErrCode::Value::ComponentMethodNeedsArg);
+    }
+    if (Par[0].getLabel() != "self"sv) {
+      spdlog::error(ErrCode::Value::ComponentMethodSelfName);
+      spdlog::error("    [method] first argument must be called `self`"sv);
+      return Unexpect(ErrCode::Value::ComponentMethodSelfName);
+    }
+    const auto BIdx = borrowResource(Ctx, Par[0].getValType());
+    if (!BIdx.has_value()) {
+      spdlog::error(ErrCode::Value::ComponentMethodSelfBorrow);
+      spdlog::error("    [method] `self` must be (borrow $T)"sv);
+      return Unexpect(ErrCode::Value::ComponentMethodSelfBorrow);
+    }
+    if (Want.has_value() && resId(*BIdx) != Want) {
+      spdlog::error(ErrCode::Value::ComponentMethodResourceMismatch);
+      spdlog::error("    [method] `self` resource does not match name"sv);
+      return Unexpect(ErrCode::Value::ComponentMethodResourceMismatch);
+    }
+  }
+  return {};
+}
+
 // Validate that a name may appear at an export position: reject the
 // `relative-url=` prefix (not part of the extern-name grammar) and any
 // plainname/interfacename kind that isn't allowed on an export.
@@ -480,15 +657,21 @@ Validator::validate(const AST::Component::AliasSection &AliasSec) noexcept {
                   CompCtx.getInstance(*It->second.NestedInstIdx).Exports;
               for (const auto &[Name, IE] : NestedExports) {
                 CompCtx.addInstanceExport(NewIdx, Name, IE.ST, IE.IT,
-                                          IE.NestedInstIdx, IE.ResourceId);
+                                          IE.NestedInstIdx, IE.ResourceId,
+                                          IE.ResourceLocallyDefined);
               }
             }
           } else if (Sort.getSortType() ==
                          AST::Component::Sort::SortType::Type &&
                      It->second.ResourceId.has_value()) {
-            // Alias-export of a resource type — same identity.
+            // Alias-export of a resource type — same identity (and locality, so
+            // resource.new/.rep on a re-surfaced local resource still pass).
+            // Register the export's kebab name as a resource label too so
+            // annotated names ([method]/[constructor]/[static]) can reference a
+            // resource surfaced from an instance.
             CompCtx.addResource(NewIdx, {*It->second.ResourceId,
-                                         /*LocallyDefined=*/false});
+                                         It->second.ResourceLocallyDefined});
+            CompCtx.addResourceLabel(std::string(SrcName), NewIdx);
           }
         }
       }
@@ -985,7 +1168,12 @@ Validator::validate(const AST::Component::Instance &Inst) noexcept {
     const auto *CompTy = CompSlot.Type;
 
     // Verify each component import is satisfied by some instantiate arg.
+    // Records the resource id of each type argument bound to a resource import,
+    // so a re-exported imported resource inherits the argument's identity.
     auto Args = Inst.getInstantiateArgs();
+    // import name -> {resource id, locally-defined} of the type argument.
+    std::unordered_map<std::string_view, std::pair<uint64_t, bool>>
+        ArgResourceIds;
     auto checkImport =
         [&](std::string_view ImportName,
             const AST::Component::ExternDesc &ImportDesc) -> Expect<void> {
@@ -1059,6 +1247,14 @@ Validator::validate(const AST::Component::Instance &Inst) noexcept {
           }
         }
       }
+      // Record the argument's resource identity for a resource type import, so
+      // a re-exported imported resource can inherit it (see export loop below).
+      if (!Sort.isCore() &&
+          Sort.getSortType() == AST::Component::Sort::SortType::Type) {
+        if (const auto *RInfo = CompCtx.getResource(Idx)) {
+          ArgResourceIds[ImportName] = {RInfo->Id, RInfo->LocallyDefined};
+        }
+      }
       return {};
     };
     if (Comp != nullptr) {
@@ -1102,8 +1298,30 @@ Validator::validate(const AST::Component::Instance &Inst) noexcept {
                   AST::Component::ExternDesc::DescType::InstanceType) {
             IT = resolveChildInstanceType(*Comp, Exp.getDesc()->getTypeIndex());
           }
-          CompCtx.addInstanceExport(InstanceIdx, Exp.getName(),
-                                    ExpSort.getSortType(), IT);
+          // Resource exports carry an identity (GAP-I-3): a resource the child
+          // defines is generative (fresh id); a re-exported imported resource
+          // inherits the matching instantiation argument's id.
+          std::optional<uint64_t> ResourceId;
+          bool ResourceLocal = false;
+          if (ExpSort.getSortType() == AST::Component::Sort::SortType::Type) {
+            const auto CR =
+                resolveChildResource(*Comp, Exp.getSortIndex().getIdx());
+            if (CR.IsResource) {
+              if (CR.LocallyDefined) {
+                // Generative: defined in the child, not local to this scope.
+                ResourceId = CompCtx.allocateFreshResourceId();
+              } else {
+                auto It = ArgResourceIds.find(CR.ImportName);
+                if (It != ArgResourceIds.end()) {
+                  ResourceId = It->second.first;
+                  ResourceLocal = It->second.second;
+                }
+              }
+            }
+          }
+          CompCtx.addInstanceExport(
+              InstanceIdx, Exp.getName(), ExpSort.getSortType(), IT,
+              /*NestedInstIdx=*/std::nullopt, ResourceId, ResourceLocal);
         }
       }
     } else if (CompTy != nullptr) {
@@ -1187,8 +1405,20 @@ Validator::validate(const AST::Component::Instance &Inst) noexcept {
         // export / instantiate sources read nullptr (Phase-3 follow-up).
         PropagatedIT = CompCtx.getInstance(Idx).Type;
       }
+      // Inline-exporting a resource type preserves its identity and locality so
+      // a later alias-export off this instance can re-register it as a
+      // resource.
+      std::optional<uint64_t> ResourceId;
+      bool ResourceLocal = false;
+      if (Sort.getSortType() == AST::Component::Sort::SortType::Type) {
+        if (const auto *RInfo = CompCtx.getResource(Idx)) {
+          ResourceId = RInfo->Id;
+          ResourceLocal = RInfo->LocallyDefined;
+        }
+      }
       CompCtx.addInstanceExport(InstanceIdx, Export.getName(),
-                                Sort.getSortType(), PropagatedIT, NestedIdx);
+                                Sort.getSortType(), PropagatedIT, NestedIdx,
+                                ResourceId, ResourceLocal);
     }
   } else {
     assumingUnreachable();
@@ -2048,20 +2278,20 @@ Expect<void> Validator::validateCanonResourceNew(
   // 2. Type must be a locally-defined resource.
   const auto *RInfo = CompCtx.getResource(Idx);
   if (RInfo == nullptr) {
-    spdlog::error(ErrCode::Value::InvalidTypeReference);
+    spdlog::error(ErrCode::Value::ComponentResourceTypeExpected);
     spdlog::error(
         "    canon resource.new: type index {} does not reference a resource"sv,
         Idx);
     spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Canonical));
-    return Unexpect(ErrCode::Value::InvalidTypeReference);
+    return Unexpect(ErrCode::Value::ComponentResourceTypeExpected);
   }
   if (!RInfo->LocallyDefined) {
-    spdlog::error(ErrCode::Value::InvalidTypeReference);
+    spdlog::error(ErrCode::Value::ComponentResourceNotLocal);
     spdlog::error(
         "    canon resource.new: type index {} is not locally defined (imported or outer-aliased resources are not allowed)"sv,
         Idx);
     spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Canonical));
-    return Unexpect(ErrCode::Value::InvalidTypeReference);
+    return Unexpect(ErrCode::Value::ComponentResourceNotLocal);
   }
   // 4. Validate canonical options.
   EXPECTED_TRY(validateCanonOptions(Canon.getOpCode(), Canon.getOptions()));
@@ -2088,20 +2318,20 @@ Expect<void> Validator::validateCanonResourceRep(
   // 2. Type must be a locally-defined resource.
   const auto *RInfo = CompCtx.getResource(Idx);
   if (RInfo == nullptr) {
-    spdlog::error(ErrCode::Value::InvalidTypeReference);
+    spdlog::error(ErrCode::Value::ComponentResourceTypeExpected);
     spdlog::error(
         "    canon resource.rep: type index {} does not reference a resource"sv,
         Idx);
     spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Canonical));
-    return Unexpect(ErrCode::Value::InvalidTypeReference);
+    return Unexpect(ErrCode::Value::ComponentResourceTypeExpected);
   }
   if (!RInfo->LocallyDefined) {
-    spdlog::error(ErrCode::Value::InvalidTypeReference);
+    spdlog::error(ErrCode::Value::ComponentResourceNotLocal);
     spdlog::error(
         "    canon resource.rep: type index {} is not locally defined (imported or outer-aliased resources are not allowed)"sv,
         Idx);
     spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Canonical));
-    return Unexpect(ErrCode::Value::InvalidTypeReference);
+    return Unexpect(ErrCode::Value::ComponentResourceNotLocal);
   }
   // 4. Validate canonical options.
   EXPECTED_TRY(validateCanonOptions(Canon.getOpCode(), Canon.getOptions()));
@@ -2127,12 +2357,12 @@ Expect<void> Validator::validateCanonResourceDrop(
   }
   // 2. Type must be a resource type.
   if (CompCtx.getResource(Idx) == nullptr) {
-    spdlog::error(ErrCode::Value::InvalidTypeReference);
+    spdlog::error(ErrCode::Value::ComponentResourceTypeExpected);
     spdlog::error(
         "    canon resource.drop: type index {} does not reference a resource"sv,
         Idx);
     spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Canonical));
-    return Unexpect(ErrCode::Value::InvalidTypeReference);
+    return Unexpect(ErrCode::Value::ComponentResourceTypeExpected);
   }
   // 3. resource.drop accepts both local and imported resources — no locality
   // check.
@@ -2220,6 +2450,22 @@ Expect<void> Validator::validate(const AST::Component::Import &Im) noexcept {
         ResourceLabel);
     spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Import));
     return Unexpect(ErrCode::Value::ComponentInvalidName);
+  }
+
+  // Validate the annotated function's signature against the resource it names.
+  if ((CName.getKind() == ComponentNameKind::Constructor ||
+       CName.getKind() == ComponentNameKind::Method) &&
+      Im.getDesc().getDescType() ==
+          AST::Component::ExternDesc::DescType::FuncType) {
+    const auto *DT = CompCtx.getDefType(Im.getDesc().getTypeIndex());
+    if (DT != nullptr && DT->isFuncType()) {
+      EXPECTED_TRY(validateAnnotatedFuncSig(CompCtx, CName, DT->getFuncType())
+                       .map_error([](auto E) {
+                         spdlog::error(
+                             ErrInfo::InfoAST(ASTNodeAttr::Comp_Import));
+                         return E;
+                       }));
+    }
   }
 
   if (!CompCtx.addImportedName(CName)) {
@@ -2363,7 +2609,20 @@ Expect<void> Validator::validate(const AST::Component::Export &Ex) noexcept {
         const auto &SrcExports = CompCtx.getInstance(Idx).Exports;
         for (const auto &[Name, IE] : SrcExports) {
           CompCtx.addInstanceExport(NewIdx, Name, IE.ST, IE.IT,
-                                    IE.NestedInstIdx);
+                                    IE.NestedInstIdx, IE.ResourceId,
+                                    IE.ResourceLocallyDefined);
+        }
+      }
+    } else if (Sort.getSortType() == AST::Component::Sort::SortType::Type) {
+      // Exporting a resource type introduces a new type index aliasing the
+      // resource. Propagate the resource identity so own / borrow and
+      // canon resource.* on the exported slot resolve, and register the
+      // export's kebab name so annotated names ([method]/[constructor]/
+      // [static]) can reference it.
+      if (const auto *RInfo = CompCtx.getResource(Idx)) {
+        CompCtx.addResource(NewIdx, {RInfo->Id, RInfo->LocallyDefined});
+        if (CName.getKind() == ComponentNameKind::Label) {
+          CompCtx.addResourceLabel(Ex.getName(), NewIdx);
         }
       }
     }
@@ -2675,14 +2934,16 @@ Validator::validate(const AST::Component::InstanceDecl &Decl) noexcept {
                   CompCtx.getInstance(*It->second.NestedInstIdx).Exports;
               for (const auto &[Name, IE] : NestedExports) {
                 CompCtx.addInstanceExport(NewInstIdx, Name, IE.ST, IE.IT,
-                                          IE.NestedInstIdx, IE.ResourceId);
+                                          IE.NestedInstIdx, IE.ResourceId,
+                                          IE.ResourceLocallyDefined);
               }
             }
           } else if (Sort.getSortType() ==
                          AST::Component::Sort::SortType::Type &&
                      It->second.ResourceId.has_value()) {
-            CompCtx.addResource(NewInstIdx, {*It->second.ResourceId,
-                                             /*LocallyDefined=*/false});
+            CompCtx.addResource(
+                NewInstIdx,
+                {*It->second.ResourceId, It->second.ResourceLocallyDefined});
           }
         }
       }
@@ -2737,31 +2998,31 @@ Validator::validate(const AST::Component::DefValType &DVT) noexcept {
   if (DVT.isOwnTy()) {
     uint32_t Idx = DVT.getOwn().Idx;
     if (Idx >= CompCtx.getSortIndexSize(AST::Component::Sort::SortType::Type)) {
-      spdlog::error(ErrCode::Value::DefTypeIndexOutOfBounds);
+      spdlog::error(ErrCode::Value::ComponentTypeIndexOutOfBounds);
       spdlog::error("    DefValType: own type index {} out of bounds"sv, Idx);
-      return Unexpect(ErrCode::Value::DefTypeIndexOutOfBounds);
+      return Unexpect(ErrCode::Value::ComponentTypeIndexOutOfBounds);
     }
     if (CompCtx.getResource(Idx) == nullptr) {
-      spdlog::error(ErrCode::Value::NotADefinedType);
+      spdlog::error(ErrCode::Value::ComponentResourceTypeExpected);
       spdlog::error(
           "    DefValType: own type index {} does not refer to a resource type"sv,
           Idx);
-      return Unexpect(ErrCode::Value::NotADefinedType);
+      return Unexpect(ErrCode::Value::ComponentResourceTypeExpected);
     }
   } else if (DVT.isBorrowTy()) {
     uint32_t Idx = DVT.getBorrow().Idx;
     if (Idx >= CompCtx.getSortIndexSize(AST::Component::Sort::SortType::Type)) {
-      spdlog::error(ErrCode::Value::DefTypeIndexOutOfBounds);
+      spdlog::error(ErrCode::Value::ComponentTypeIndexOutOfBounds);
       spdlog::error("    DefValType: borrow type index {} out of bounds"sv,
                     Idx);
-      return Unexpect(ErrCode::Value::DefTypeIndexOutOfBounds);
+      return Unexpect(ErrCode::Value::ComponentTypeIndexOutOfBounds);
     }
     if (CompCtx.getResource(Idx) == nullptr) {
-      spdlog::error(ErrCode::Value::NotADefinedType);
+      spdlog::error(ErrCode::Value::ComponentResourceTypeExpected);
       spdlog::error(
           "    DefValType: borrow type index {} does not refer to a resource type"sv,
           Idx);
-      return Unexpect(ErrCode::Value::NotADefinedType);
+      return Unexpect(ErrCode::Value::ComponentResourceTypeExpected);
     }
   } else if (DVT.isRecordTy()) {
     const auto &Rec = DVT.getRecord();
@@ -2935,10 +3196,10 @@ Expect<void> Validator::validate(const AST::Component::FuncType &FT) noexcept {
   for (const auto &R : FT.getResultList()) {
     EXPECTED_TRY(validate(R.getValType()));
     if (containsBorrow(R.getValType())) {
-      spdlog::error(ErrCode::Value::InvalidTypeReference);
+      spdlog::error(ErrCode::Value::ComponentBorrowInResult);
       spdlog::error(
           "    FuncType: borrow type not allowed in function results"sv);
-      return Unexpect(ErrCode::Value::InvalidTypeReference);
+      return Unexpect(ErrCode::Value::ComponentBorrowInResult);
     }
   }
   return {};
@@ -2976,20 +3237,28 @@ Expect<void>
 Validator::validate(const AST::Component::ResourceType &RT) noexcept {
   // Resource types are not allowed inside componenttype/instancetype scopes.
   if (CompCtx.isTypeDefinitionScope()) {
-    spdlog::error(ErrCode::Value::InvalidTypeReference);
+    spdlog::error(ErrCode::Value::ComponentResourceAbstractDef);
     spdlog::error("    ResourceType: resource types cannot be defined inside "
                   "componenttype or instancetype"sv);
-    return Unexpect(ErrCode::Value::InvalidTypeReference);
+    return Unexpect(ErrCode::Value::ComponentResourceAbstractDef);
+  }
+  // Resource representation must be i32 (i64 requires the memory64 proposal,
+  // gated at load; reject here for the validation-phase diagnostic).
+  if (RT.isAddrI64()) {
+    spdlog::error(ErrCode::Value::ComponentResourceRepNotI32);
+    spdlog::error(
+        "    ResourceType: resources can only be represented by i32"sv);
+    return Unexpect(ErrCode::Value::ComponentResourceRepNotI32);
   }
   if (RT.getDestructor().has_value()) {
     uint32_t DtorIdx = *RT.getDestructor();
     if (DtorIdx >= CompCtx.getCoreSortIndexSize(
                        AST::Component::Sort::CoreSortType::Func)) {
-      spdlog::error(ErrCode::Value::InvalidIndex);
+      spdlog::error(ErrCode::Value::ComponentDtorFuncIndexOOB);
       spdlog::error(
           "    ResourceType: destructor core func index {} out of bounds"sv,
           DtorIdx);
-      return Unexpect(ErrCode::Value::InvalidIndex);
+      return Unexpect(ErrCode::Value::ComponentDtorFuncIndexOOB);
     }
     // Verify the destructor's signature is `[i32] -> []`. The signature is
     // only available for core funcs the validator has populated (canon
@@ -3005,11 +3274,11 @@ Validator::validate(const AST::Component::ResourceType &RT) noexcept {
       const auto &ExpType = CoreFuncType_I32_Void.getCompositeType();
       if (!DtorType.isFunc() ||
           DtorType.getFuncType() != ExpType.getFuncType()) {
-        spdlog::error(ErrCode::Value::InvalidTypeReference);
+        spdlog::error(ErrCode::Value::ComponentDtorWrongSignature);
         spdlog::error(
             "    ResourceType: destructor core func {} must have signature [i32] -> []"sv,
             DtorIdx);
-        return Unexpect(ErrCode::Value::InvalidTypeReference);
+        return Unexpect(ErrCode::Value::ComponentDtorWrongSignature);
       }
     }
   }

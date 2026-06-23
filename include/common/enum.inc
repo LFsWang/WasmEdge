@@ -1150,6 +1150,45 @@ E(ComponentValueAlreadyConsumed, 0x02C0,
   "value has already been consumed")
 E(ComponentValueNotConsumed, 0x02C1,
   "value was not consumed before end of component")
+// own/borrow/canon resource references a type that is not a resource
+E(ComponentResourceTypeExpected, 0x02DB, "not a resource type")
+// canon resource.new/rep references a resource that is not locally defined
+E(ComponentResourceNotLocal, 0x02DC, "not a local resource")
+// Annotated name ([method]/[static]) is missing the `.` separator
+E(ComponentNameMissingDot, 0x02DD, "failed to find `.` character")
+// Component type index out of bounds
+E(ComponentTypeIndexOutOfBounds, 0x02DE, "type index out of bounds")
+// Function result type contains a borrow
+E(ComponentBorrowInResult, 0x02DF,
+  "function result cannot contain a `borrow` type")
+// [constructor] func own result does not match the annotated resource
+E(ComponentCtorResourceMismatch, 0x02C4,
+  "function does not match expected resource name")
+// [method] func borrow self does not match the annotated resource
+E(ComponentMethodResourceMismatch, 0x02C5,
+  "does not match expected resource name")
+// [constructor] func must return exactly one value
+E(ComponentCtorReturnOne, 0x02C6, "should return one value")
+// [constructor] func result must be (own $T) or (result (own $T))
+E(ComponentCtorReturnOwnOrResult, 0x02C8,
+  "function should return `(own $T)` or `(result (own $T))`")
+// [method] func must take at least one argument
+E(ComponentMethodNeedsArg, 0x02C9, "should have at least one argument")
+// [method] func first argument must be called `self`
+E(ComponentMethodSelfName, 0x02CA, "should have a first argument called `self`")
+// [method] func first argument must be (borrow $T)
+E(ComponentMethodSelfBorrow, 0x02CB,
+  "should take a first argument of `(borrow $T)`")
+// Resource destructor function index out of bounds
+E(ComponentDtorFuncIndexOOB, 0x02D3, "function index out of bounds")
+// Resources can only be defined within a concrete component
+E(ComponentResourceAbstractDef, 0x02D4,
+  "resources can only be defined within a concrete component")
+// Resource representation must be i32
+E(ComponentResourceRepNotI32, 0x02D5,
+  "resources can only be represented by `i32`")
+// Resource destructor has the wrong signature (must be [i32] -> [])
+E(ComponentDtorWrongSignature, 0x02DA, "wrong signature for a destructor")
 // @}
 
 // Instantiation phase

@@ -1826,31 +1826,114 @@ TEST(ComponentValidatorTest, AnnotatedNameMissingResourceRejected) {
 }
 
 TEST(ComponentValidatorTest, AnnotatedNameResourceInScopePasses) {
-  // type 0: FuncType
-  // import "r" (type (sub resource))    ;; resource "r" → type 1
-  // import "[method]r.f" (func (type 0)) ;; PASS — resource "r" is in scope
+  // import "r" (type (sub resource))           ;; resource "r" → type 0
+  // type 1: (func (param "self" (borrow 0)))   ;; valid method signature
+  // import "[method]r.f" (func (type 1))       ;; PASS — resource "r" in scope
+  // The method's first parameter must be `self: (borrow $r)`; an empty
+  // signature is rejected by the [method] annotation rules.
   AST::Component::Component Comp;
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::ImportSection>();
   Comp.getSections().emplace_back();
   Comp.getSections().back().emplace<AST::Component::TypeSection>();
   Comp.getSections().emplace_back();
   Comp.getSections().back().emplace<AST::Component::ImportSection>();
 
-  auto &TypeSec = std::get<AST::Component::TypeSection>(Comp.getSections()[0]);
-  TypeSec.getContent().emplace_back();
-  TypeSec.getContent().back().setFuncType(AST::Component::FuncType());
+  // Resource import → type index 0.
+  auto &ImpSec0 =
+      std::get<AST::Component::ImportSection>(Comp.getSections()[0]);
+  ImpSec0.getContent().emplace_back();
+  ImpSec0.getContent().back().getName() = "r";
+  ImpSec0.getContent().back().getDesc().setTypeBound();
 
-  auto &ImpSec = std::get<AST::Component::ImportSection>(Comp.getSections()[1]);
-  // Resource import.
-  ImpSec.getContent().emplace_back();
-  ImpSec.getContent().back().getName() = "r";
-  ImpSec.getContent().back().getDesc().setTypeBound();
+  // Method func type with `self: (borrow 0)` → type index 1.
+  auto &TypeSec = std::get<AST::Component::TypeSection>(Comp.getSections()[1]);
+  TypeSec.getContent().emplace_back();
+  AST::Component::FuncType FT;
+  std::vector<AST::Component::LabelValType> Params;
+  Params.emplace_back("self"s, ComponentValType(ComponentTypeCode::Borrow, 0));
+  FT.setParamList(std::move(Params));
+  TypeSec.getContent().back().setFuncType(std::move(FT));
+
   // Annotated method import referencing resource "r".
-  ImpSec.getContent().emplace_back();
-  ImpSec.getContent().back().getName() = "[method]r.f";
-  ImpSec.getContent().back().getDesc().setFuncTypeIdx(0);
+  auto &ImpSec1 =
+      std::get<AST::Component::ImportSection>(Comp.getSections()[2]);
+  ImpSec1.getContent().emplace_back();
+  ImpSec1.getContent().back().getName() = "[method]r.f";
+  ImpSec1.getContent().back().getDesc().setFuncTypeIdx(1);
 
   Validator::Validator V(Conf);
   ASSERT_TRUE(V.validate(Comp));
+}
+
+// A [method] whose first parameter is not (borrow $r) is rejected.
+TEST(ComponentValidatorTest, MethodSelfMustBeBorrow) {
+  AST::Component::Component Comp;
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::ImportSection>();
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::TypeSection>();
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::ImportSection>();
+
+  auto &ImpSec0 =
+      std::get<AST::Component::ImportSection>(Comp.getSections()[0]);
+  ImpSec0.getContent().emplace_back();
+  ImpSec0.getContent().back().getName() = "r";
+  ImpSec0.getContent().back().getDesc().setTypeBound();
+
+  // self has type u32 instead of (borrow 0).
+  auto &TypeSec = std::get<AST::Component::TypeSection>(Comp.getSections()[1]);
+  TypeSec.getContent().emplace_back();
+  AST::Component::FuncType FT;
+  std::vector<AST::Component::LabelValType> Params;
+  Params.emplace_back("self"s, ComponentValType(ComponentTypeCode::U32));
+  FT.setParamList(std::move(Params));
+  TypeSec.getContent().back().setFuncType(std::move(FT));
+
+  auto &ImpSec1 =
+      std::get<AST::Component::ImportSection>(Comp.getSections()[2]);
+  ImpSec1.getContent().emplace_back();
+  ImpSec1.getContent().back().getName() = "[method]r.f";
+  ImpSec1.getContent().back().getDesc().setFuncTypeIdx(1);
+
+  Validator::Validator V(Conf);
+  ASSERT_FALSE(V.validate(Comp));
+}
+
+// A [constructor] whose result is not (own $r) is rejected.
+TEST(ComponentValidatorTest, ConstructorMustReturnOwn) {
+  AST::Component::Component Comp;
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::ImportSection>();
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::TypeSection>();
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::ImportSection>();
+
+  auto &ImpSec0 =
+      std::get<AST::Component::ImportSection>(Comp.getSections()[0]);
+  ImpSec0.getContent().emplace_back();
+  ImpSec0.getContent().back().getName() = "r";
+  ImpSec0.getContent().back().getDesc().setTypeBound();
+
+  // Constructor returns u32 instead of (own 0).
+  auto &TypeSec = std::get<AST::Component::TypeSection>(Comp.getSections()[1]);
+  TypeSec.getContent().emplace_back();
+  AST::Component::FuncType FT;
+  std::vector<AST::Component::LabelValType> Results;
+  Results.emplace_back(ComponentValType(ComponentTypeCode::U32));
+  FT.setResultList(std::move(Results));
+  TypeSec.getContent().back().setFuncType(std::move(FT));
+
+  auto &ImpSec1 =
+      std::get<AST::Component::ImportSection>(Comp.getSections()[2]);
+  ImpSec1.getContent().emplace_back();
+  ImpSec1.getContent().back().getName() = "[constructor]r";
+  ImpSec1.getContent().back().getDesc().setFuncTypeIdx(1);
+
+  Validator::Validator V(Conf);
+  ASSERT_FALSE(V.validate(Comp));
 }
 
 // =============================================================================

@@ -59,6 +59,10 @@ public:
       const AST::Component::InstanceType *IT;
       std::optional<uint32_t> NestedInstIdx;
       std::optional<uint64_t> ResourceId;
+      // Whether the exported resource is locally defined in the component that
+      // produced this instance export, so an alias-export can preserve the
+      // locality that gates resource.new/.rep.
+      bool ResourceLocallyDefined = false;
     };
     // Instance slot. Type is set only when bound via
     // validate(ExternDesc::InstanceType) (GAP-I-5b follow-up otherwise).
@@ -454,14 +458,14 @@ public:
     return getCurrentContext().Instances.at(Idx);
   }
 
-  void addInstanceExport(
-      uint32_t InstIdx, std::string_view Name,
-      AST::Component::Sort::SortType ST,
-      const AST::Component::InstanceType *IT = nullptr,
-      std::optional<uint32_t> NestedInstIdx = std::nullopt,
-      std::optional<uint64_t> ResourceId = std::nullopt) noexcept {
+  void addInstanceExport(uint32_t InstIdx, std::string_view Name,
+                         AST::Component::Sort::SortType ST,
+                         const AST::Component::InstanceType *IT = nullptr,
+                         std::optional<uint32_t> NestedInstIdx = std::nullopt,
+                         std::optional<uint64_t> ResourceId = std::nullopt,
+                         bool ResourceLocallyDefined = false) noexcept {
     getCurrentContext().Instances.at(InstIdx).Exports[std::string(Name)] = {
-        ST, IT, NestedInstIdx, ResourceId};
+        ST, IT, NestedInstIdx, ResourceId, ResourceLocallyDefined};
   }
 
   // ==========================================================================
@@ -524,6 +528,17 @@ public:
   bool hasResourceLabel(std::string_view Name) const noexcept {
     return getCurrentContext().ResourceLabels.find(std::string(Name)) !=
            getCurrentContext().ResourceLabels.end();
+  }
+
+  // Resolve a kebab resource label to its type index, if present.
+  std::optional<uint32_t>
+  getResourceLabel(std::string_view Name) const noexcept {
+    const auto &M = getCurrentContext().ResourceLabels;
+    auto It = M.find(std::string(Name));
+    if (It == M.end()) {
+      return std::nullopt;
+    }
+    return It->second;
   }
 
   // ==========================================================================

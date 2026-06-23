@@ -353,7 +353,11 @@ Expect<ComponentName> ComponentName::parse(std::string_view Name) {
 
   if (tryRead("[constructor]"sv, Next)) {
     if (!isKebabString(Next)) {
-      return reportError("invalid label after [constructor]"sv);
+      // Empty / non-kebab constructor label.
+      spdlog::error(ErrCode::Value::ComponentNameNotKebab);
+      spdlog::error("    Component name: label '{}' is not in kebab case"sv,
+                    Next);
+      return Unexpect(ErrCode::Value::ComponentNameNotKebab);
     }
     Result.Detail.emplace<ConstructorDetail>(ConstructorDetail{Next});
     Result.NoTagName = Next;
@@ -361,21 +365,26 @@ Expect<ComponentName> ComponentName::parse(std::string_view Name) {
     return Result;
   }
 
+  // Parse `[method]`/`[static]` annotations. Once the tag matches the rest is
+  // committed: a missing `.` or non-kebab segment is a hard error (matches the
+  // spec messages) rather than a silent fall-through to plain-label parsing.
   auto tryReadResourceWithLabel = [&](std::string_view Tag,
                                       std::string_view &Resource,
-                                      std::string_view &Label) -> bool {
-    auto Saved = Next;
+                                      std::string_view &Label) -> Expect<bool> {
     if (!tryRead(Tag, Next)) {
       return false;
     }
     auto TmpNoTagName = Next;
     if (!readUntil(Next, '.', Resource)) {
-      Next = Saved;
-      return false;
+      spdlog::error(ErrCode::Value::ComponentNameMissingDot);
+      spdlog::error("    Component name: failed to find `.` character"sv);
+      return Unexpect(ErrCode::Value::ComponentNameMissingDot);
     }
     if (!isKebabString(Resource) || !isKebabString(Next)) {
-      Next = Saved;
-      return false;
+      spdlog::error(ErrCode::Value::ComponentNameNotKebab);
+      spdlog::error(
+          "    Component name: annotated label is not in kebab case"sv);
+      return Unexpect(ErrCode::Value::ComponentNameNotKebab);
     }
     Result.NoTagName = TmpNoTagName;
     Label = Next;
@@ -384,7 +393,9 @@ Expect<ComponentName> ComponentName::parse(std::string_view Name) {
 
   {
     std::string_view Resource, Label;
-    if (tryReadResourceWithLabel("[method]"sv, Resource, Label)) {
+    EXPECTED_TRY(bool Matched,
+                 tryReadResourceWithLabel("[method]"sv, Resource, Label));
+    if (Matched) {
       Result.Detail.emplace<MethodDetail>(MethodDetail{Resource, Label});
       Result.Kind = ComponentNameKind::Method;
       return Result;
@@ -393,7 +404,9 @@ Expect<ComponentName> ComponentName::parse(std::string_view Name) {
 
   {
     std::string_view Resource, Label;
-    if (tryReadResourceWithLabel("[static]"sv, Resource, Label)) {
+    EXPECTED_TRY(bool Matched,
+                 tryReadResourceWithLabel("[static]"sv, Resource, Label));
+    if (Matched) {
       Result.Detail.emplace<StaticDetail>(StaticDetail{Resource, Label});
       Result.Kind = ComponentNameKind::Static;
       return Result;
