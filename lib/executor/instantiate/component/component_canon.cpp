@@ -3,6 +3,7 @@
 
 #include "executor/component/canonical_abi.h"
 #include "executor/component/lower_thunk.h"
+#include "executor/component/resource_builtins.h"
 #include "executor/executor.h"
 
 #include "common/errinfo.h"
@@ -36,9 +37,11 @@ Expect<std::vector<ValVariant>> Executor::convValsToCoreWASM(
     Span<const ComponentValVariant> Vals, Span<const ComponentValType> ValTypes,
     Runtime::Instance::FunctionInstance *RFuncInst,
     Runtime::Instance::MemoryInstance *MemInst,
-    const Runtime::Instance::ComponentInstance *CompInst, StringEncoding Enc) {
+    const Runtime::Instance::ComponentInstance *CompInst, StringEncoding Enc,
+    Runtime::Instance::Component::BorrowScope *Scope) {
   // Wrapper over the spec's lower_flat_values (CanonicalABI.md L3212-3232).
   CanonicalABI::CanonCtx Cx{this, MemInst, RFuncInst, CompInst, {}, Enc};
+  Cx.Scope = Scope;
   return CanonicalABI::lowerFlatValues(Cx, Vals, ValTypes,
                                        CanonicalABI::MaxFlatParams);
 }
@@ -217,7 +220,33 @@ Executor::instantiate(Runtime::Instance::ComponentInstance &CompInst,
     }
     case ComponentCanonOpCode::Resource__new:
     case ComponentCanonOpCode::Resource__drop:
-    case ComponentCanonOpCode::Resource__rep:
+    case ComponentCanonOpCode::Resource__rep: {
+      // The canon index is the resource type index (validator-synthesized core
+      // signatures match new/rep [i32]->[i32], drop [i32]->[]). Register a host
+      // function backed by the instance's resource handle table.
+      const auto *ResType = CompInst.getType(Canon.getIndex());
+      if (ResType == nullptr || !ResType->isResourceType()) {
+        spdlog::error(ErrCode::Value::InvalidCanonOption);
+        spdlog::error(
+            "    canon resource: index does not refer to a resource"sv);
+        return Unexpect(ErrCode::Value::InvalidCanonOption);
+      }
+      if (ResType->getResourceType().isAddrI64()) {
+        spdlog::error(ErrCode::Value::ComponentNotImplInstantiate);
+        spdlog::error(
+            "    canon resource: i64 representation not implemented"sv);
+        return Unexpect(ErrCode::Value::ComponentNotImplInstantiate);
+      }
+      ResourceOp Op = Canon.getOpCode() == ComponentCanonOpCode::Resource__new
+                          ? ResourceOp::New
+                      : Canon.getOpCode() == ComponentCanonOpCode::Resource__rep
+                          ? ResourceOp::Rep
+                          : ResourceOp::Drop;
+      auto Thunk =
+          std::make_unique<CanonResourceHostFunc>(this, Op, ResType, &CompInst);
+      CompInst.addCoreHostFunction(std::move(Thunk), "$resource-builtin");
+      break;
+    }
     default:
       spdlog::error(ErrCode::Value::ComponentNotImplInstantiate);
       spdlog::error("    incomplete canonical"sv);
