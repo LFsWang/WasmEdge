@@ -521,9 +521,94 @@ Expect<ComponentName> validateExportName(std::string_view Name) noexcept {
 
 } // namespace
 
+namespace {
+// Whether an instance-type declaration introduces a component type-space
+// entry, matching the order the loader assigns type indices inside an
+// instancetype body.
+bool instanceDeclIntroducesType(const AST::Component::InstanceDecl &D) {
+  if (D.isType()) {
+    return true;
+  }
+  if (D.isAlias()) {
+    const auto &S = D.getAlias().getSort();
+    return !S.isCore() &&
+           S.getSortType() == AST::Component::Sort::SortType::Type;
+  }
+  if (D.isExportDecl()) {
+    // Only a type export ((sub resource) / (eq i)) introduces a type-space
+    // entry; func / instance / component / value exports introduce indices in
+    // their own sorts.
+    return D.getExport().getExternDesc().getDescType() ==
+           AST::Component::ExternDesc::DescType::TypeBound;
+  }
+  return false;
+}
+} // namespace
+
 void Validator::populateInstanceFromType(
     uint32_t InstIdx, const AST::Component::InstanceType &IT) noexcept {
+  // First pass: build this instancetype's type index space, allocating fresh
+  // resource ids for `(sub resource)` exports, so func exports can resolve the
+  // resource identities of their own/borrow params and results.
+  struct TSEntry {
+    const AST::Component::DefType *DT = nullptr;
+    std::optional<uint64_t> ResId;
+  };
+  std::vector<TSEntry> TypeSpace;
   for (const auto &Decl : IT.getDecl()) {
+    if (!instanceDeclIntroducesType(Decl)) {
+      continue;
+    }
+    TSEntry E;
+    if (Decl.isType()) {
+      E.DT = Decl.getType();
+    } else if (Decl.isExportDecl()) {
+      const auto &ED = Decl.getExport().getExternDesc();
+      if (ED.getDescType() == AST::Component::ExternDesc::DescType::TypeBound &&
+          !ED.isEqType()) {
+        E.ResId = CompCtx.allocateFreshResourceId();
+      }
+    }
+    TypeSpace.push_back(E);
+  }
+
+  // Resolve a value type, within this type space, to the resource id it
+  // owns/borrows (peeling a single own/borrow indirection).
+  auto ResolveResId =
+      [&](const ComponentValType &VT) -> std::optional<uint64_t> {
+    uint32_t Idx;
+    if (VT.getCode() == ComponentTypeCode::Own ||
+        VT.getCode() == ComponentTypeCode::Borrow) {
+      Idx = VT.getTypeIndex();
+    } else if (VT.getCode() == ComponentTypeCode::TypeIndex) {
+      const uint32_t TI = VT.getTypeIndex();
+      if (TI >= TypeSpace.size() || TypeSpace[TI].DT == nullptr ||
+          !TypeSpace[TI].DT->isDefValType()) {
+        return std::nullopt;
+      }
+      const auto &D = TypeSpace[TI].DT->getDefValType();
+      if (D.isOwnTy()) {
+        Idx = D.getOwn().Idx;
+      } else if (D.isBorrowTy()) {
+        Idx = D.getBorrow().Idx;
+      } else {
+        return std::nullopt;
+      }
+    } else {
+      return std::nullopt;
+    }
+    return Idx < TypeSpace.size() ? TypeSpace[Idx].ResId : std::nullopt;
+  };
+
+  // Second pass: add the exports, tracking the type-space index of each
+  // type-introducing export so resource ids line up with the first pass.
+  uint32_t TSIdx = 0;
+  for (const auto &Decl : IT.getDecl()) {
+    const bool IntroducesType = instanceDeclIntroducesType(Decl);
+    const uint32_t ThisTS = TSIdx;
+    if (IntroducesType) {
+      TSIdx++;
+    }
     if (!Decl.isExportDecl()) {
       continue;
     }
@@ -531,8 +616,6 @@ void Validator::populateInstanceFromType(
     const auto &ED = Exp.getExternDesc();
     auto ST = descTypeToSortType(ED.getDescType());
     if (!ST.has_value()) {
-      // InstanceExport::ST has no `(core module)` variant — skip rather
-      // than crash. TODO: extend InstanceExport with a core-sort alternative.
       spdlog::debug(
           "    populateInstanceFromType: skipping `(core module)` export "
           "'{}'"sv,
@@ -547,17 +630,30 @@ void Validator::populateInstanceFromType(
         NestedIT = resolveNestedInstanceType(IT, ED.getTypeIndex());
       }
     }
-    // Resource-typed exports carry a canonical id so an alias-export of
-    // the type slot can preserve identity. `(sub resource)` introduces a
-    // fresh id; `(eq i)` should inherit, but cross-scope resource lookup
-    // inside an InstanceType body is not yet implemented (TODO).
     std::optional<uint64_t> ResourceId;
-    if (ED.getDescType() == AST::Component::ExternDesc::DescType::TypeBound &&
-        !ED.isEqType()) {
-      ResourceId = CompCtx.allocateFreshResourceId();
+    if (IntroducesType && ThisTS < TypeSpace.size()) {
+      ResourceId = TypeSpace[ThisTS].ResId;
     }
     CompCtx.addInstanceExport(InstIdx, Exp.getName(), *ST, NestedIT,
                               /*NestedInstIdx=*/std::nullopt, ResourceId);
+    // A function export records the resource identities of its params/results
+    // so an alias-export of it carries the signature for subtype checks.
+    if (ED.getDescType() == AST::Component::ExternDesc::DescType::FuncType) {
+      const uint32_t FTI = ED.getTypeIndex();
+      if (FTI < TypeSpace.size() && TypeSpace[FTI].DT != nullptr &&
+          TypeSpace[FTI].DT->isFuncType()) {
+        const auto &FT = TypeSpace[FTI].DT->getFuncType();
+        std::vector<std::optional<uint64_t>> Params, Results;
+        for (const auto &P : FT.getParamList()) {
+          Params.push_back(ResolveResId(P.getValType()));
+        }
+        for (const auto &R : FT.getResultList()) {
+          Results.push_back(ResolveResId(R.getValType()));
+        }
+        CompCtx.setInstanceExportFuncSig(InstIdx, Exp.getName(),
+                                         std::move(Params), std::move(Results));
+      }
+    }
   }
 }
 
@@ -881,6 +977,13 @@ Validator::validate(const AST::Component::AliasSection &AliasSec) noexcept {
             // context (resources.wast "imports aren't transitive").
             CompCtx.addResource(NewIdx, {*It->second.ResourceId,
                                          It->second.ResourceLocallyDefined});
+          } else if (Sort.getSortType() ==
+                         AST::Component::Sort::SortType::Func &&
+                     It->second.HasFuncSig) {
+            // Alias-export of a function — carry its resource signature so an
+            // instantiation subtype check can compare resource identities.
+            CompCtx.setFuncResourceSig(NewIdx, It->second.FuncParamRes,
+                                       It->second.FuncResultRes);
           }
         }
       }
@@ -1552,8 +1655,13 @@ Validator::validate(const AST::Component::Instance &Inst) noexcept {
               AST::Component::ExternDesc::DescType::FuncType) {
         const auto *ReqDT =
             resolveChildDefType(*Comp, ImportDesc.getTypeIndex());
+        // The provided func's resource info comes either from a tracked
+        // signature (an alias-export of an instance's function) or, for a
+        // directly-declared func, from its component func type.
+        const auto *ProvSig = CompCtx.getFuncResourceSig(Idx);
         const auto *ProvFT = CompCtx.getFunc(Idx);
-        if (ReqDT != nullptr && ReqDT->isFuncType() && ProvFT != nullptr) {
+        if (ReqDT != nullptr && ReqDT->isFuncType() &&
+            (ProvSig != nullptr || ProvFT != nullptr)) {
           const auto &ReqFT = ReqDT->getFuncType();
           // Required resource id of a child value type, mapped through the
           // substitution (child import name -> bound argument id).
@@ -1570,31 +1678,50 @@ Validator::validate(const AST::Component::Instance &Inst) noexcept {
             }
             return std::nullopt;
           };
-          auto ProvResId =
-              [&](const ComponentValType &VT) -> std::optional<uint64_t> {
-            if (auto OIdx = ownOrBorrowResource(CompCtx, VT)) {
+          auto ProvParam = [&](size_t I) -> std::optional<uint64_t> {
+            if (ProvSig != nullptr) {
+              return I < ProvSig->first.size() ? ProvSig->first[I]
+                                               : std::nullopt;
+            }
+            const auto &PP = ProvFT->getParamList();
+            if (auto OIdx = ownOrBorrowResource(CompCtx, PP[I].getValType())) {
               if (const auto *R = CompCtx.getResource(*OIdx)) {
                 return R->Id;
               }
             }
             return std::nullopt;
           };
-          auto Mismatch = [&](const ComponentValType &Req,
-                              const ComponentValType &Prov) {
-            const auto R = ReqResId(Req);
-            const auto P = ProvResId(Prov);
-            return R.has_value() && P.has_value() && *R != *P;
+          auto ProvResult = [&](size_t I) -> std::optional<uint64_t> {
+            if (ProvSig != nullptr) {
+              return I < ProvSig->second.size() ? ProvSig->second[I]
+                                                : std::nullopt;
+            }
+            const auto &PR = ProvFT->getResultList();
+            if (auto OIdx = ownOrBorrowResource(CompCtx, PR[I].getValType())) {
+              if (const auto *R = CompCtx.getResource(*OIdx)) {
+                return R->Id;
+              }
+            }
+            return std::nullopt;
           };
           const auto &RP = ReqFT.getParamList();
-          const auto &PP = ProvFT->getParamList();
           const auto &RR = ReqFT.getResultList();
-          const auto &PR = ProvFT->getResultList();
-          bool Bad = RP.size() != PP.size() || RR.size() != PR.size();
+          const size_t ProvParamN = ProvSig != nullptr
+                                        ? ProvSig->first.size()
+                                        : ProvFT->getParamList().size();
+          const size_t ProvResultN = ProvSig != nullptr
+                                         ? ProvSig->second.size()
+                                         : ProvFT->getResultList().size();
+          bool Bad = RP.size() != ProvParamN || RR.size() != ProvResultN;
           for (size_t I = 0; !Bad && I < RP.size(); ++I) {
-            Bad = Mismatch(RP[I].getValType(), PP[I].getValType());
+            const auto R = ReqResId(RP[I].getValType());
+            const auto P = ProvParam(I);
+            Bad = R.has_value() && P.has_value() && *R != *P;
           }
           for (size_t I = 0; !Bad && I < RR.size(); ++I) {
-            Bad = Mismatch(RR[I].getValType(), PR[I].getValType());
+            const auto R = ReqResId(RR[I].getValType());
+            const auto P = ProvResult(I);
+            Bad = R.has_value() && P.has_value() && *R != *P;
           }
           if (Bad) {
             spdlog::error(ErrCode::Value::ArgTypeMismatch);

@@ -63,6 +63,13 @@ public:
       // produced this instance export, so an alias-export can preserve the
       // locality that gates resource.new/.rep.
       bool ResourceLocallyDefined = false;
+      // For ST == Func: the resource id referenced by each param / result (or
+      // nullopt where the param / result is not a resource), so an
+      // alias-export of the function carries its resource signature for
+      // instantiation subtype checks.
+      bool HasFuncSig = false;
+      std::vector<std::optional<uint64_t>> FuncParamRes;
+      std::vector<std::optional<uint64_t>> FuncResultRes;
     };
     // Instance slot. Type is set only when bound via
     // validate(ExternDesc::InstanceType) (GAP-I-5b follow-up otherwise).
@@ -160,6 +167,13 @@ public:
     // Resource ids imported into this component (directly or via an imported
     // instance), so a function imported here may reference them.
     std::unordered_set<uint64_t> ImportableResourceIds;
+    // Per component-func-index resource signature (param ids, result ids),
+    // recorded when a function is alias-exported from an instance so an
+    // instantiation subtype check can compare resource identities.
+    std::unordered_map<uint32_t,
+                       std::pair<std::vector<std::optional<uint64_t>>,
+                                 std::vector<std::optional<uint64_t>>>>
+        FuncResourceSigs;
 
     // ---- Validation state ----
     std::unordered_map<std::string, uint32_t> TypeSubstitutions;
@@ -297,6 +311,18 @@ public:
   const std::unordered_map<std::string, Context::CoreInstanceExport> &
   getCoreInstance(uint32_t Idx) const noexcept {
     return getCurrentContext().CoreInstances.at(Idx);
+  }
+
+  void setInstanceExportFuncSig(uint32_t InstIdx, std::string_view Name,
+                                std::vector<std::optional<uint64_t>> Params,
+                                std::vector<std::optional<uint64_t>> Results) {
+    auto &Exports = getCurrentContext().Instances.at(InstIdx).Exports;
+    auto It = Exports.find(std::string(Name));
+    if (It != Exports.end()) {
+      It->second.HasFuncSig = true;
+      It->second.FuncParamRes = std::move(Params);
+      It->second.FuncResultRes = std::move(Results);
+    }
   }
 
   void addCoreInstanceExport(uint32_t InstIdx, std::string_view Name,
@@ -490,7 +516,14 @@ public:
                          std::optional<uint64_t> ResourceId = std::nullopt,
                          bool ResourceLocallyDefined = false) noexcept {
     getCurrentContext().Instances.at(InstIdx).Exports[std::string(Name)] = {
-        ST, IT, NestedInstIdx, ResourceId, ResourceLocallyDefined};
+        ST,
+        IT,
+        NestedInstIdx,
+        ResourceId,
+        ResourceLocallyDefined,
+        /*HasFuncSig=*/false,
+        {},
+        {}};
   }
 
   // ==========================================================================
@@ -559,6 +592,19 @@ public:
   bool isResourceImportable(uint64_t Id) const noexcept {
     const auto &S = getCurrentContext().ImportableResourceIds;
     return S.find(Id) != S.end();
+  }
+  void setFuncResourceSig(uint32_t FuncIdx,
+                          std::vector<std::optional<uint64_t>> Params,
+                          std::vector<std::optional<uint64_t>> Results) {
+    getCurrentContext().FuncResourceSigs[FuncIdx] = {std::move(Params),
+                                                     std::move(Results)};
+  }
+  const std::pair<std::vector<std::optional<uint64_t>>,
+                  std::vector<std::optional<uint64_t>>> *
+  getFuncResourceSig(uint32_t FuncIdx) const noexcept {
+    const auto &M = getCurrentContext().FuncResourceSigs;
+    auto It = M.find(FuncIdx);
+    return It == M.end() ? nullptr : &It->second;
   }
 
   /// Register a kebab-case resource name (from a TypeBound import / export)
