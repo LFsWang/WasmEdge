@@ -3531,9 +3531,13 @@ Expect<void> Validator::validate(const AST::Component::Export &Ex) noexcept {
       // instance-of-instance exports) are exported too, so a function exported
       // from this component may reference them.
       std::vector<uint32_t> WL{NewIdx};
+      std::unordered_set<uint32_t> Seen;
       while (!WL.empty()) {
         const uint32_t Cur = WL.back();
         WL.pop_back();
+        if (!Seen.insert(Cur).second) {
+          continue;
+        }
         for (const auto &[Name, IE] : CompCtx.getInstance(Cur).Exports) {
           if (IE.ResourceId.has_value()) {
             CompCtx.markResourceExported(*IE.ResourceId);
