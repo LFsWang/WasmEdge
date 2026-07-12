@@ -3468,17 +3468,17 @@ Expect<void> Validator::validateCanonResourceDrop(
 }
 
 Expect<void> Validator::validate(const AST::Component::Import &Im) noexcept {
-  // Validation steps:
-  //   1. Validate the externdesc and introduce the imported entity into
-  //      its sort's index space.
-  //   2. Parse the import name per the structured import-name grammar.
-  //   3. Enforce the annotated-name constraints ([constructor]/[method]/
-  //      [static] only on func imports).
-  //   4. Reject duplicate import names (strongly-unique across imports).
-  //
-  // The per-annotated-name structural checks (constructor result type,
-  // method `self` param, static resource name in scope) are not yet
-  // implemented and tracked as follow-ups below.
+  // Validation steps, in the order shared with Export / ImportDecl / ExportDecl
+  // so the four import/export paths cannot drift apart:
+  //   1. bounds:     validate the externdesc, introducing the imported entity
+  //                  into its sort's index space.
+  //   2. propagate:  mark resources introduced here (importable / provenance).
+  //   3. name:       parse the import name per the import-name grammar.
+  //   4. dup:        reject duplicate import names (strongly-unique).
+  //   5. annotated:  enforce the annotated-name constraints (checkAnnotatedName).
+  //   6. resource:   an imported func may only reference importable resources.
+  //   7. label:      register a TypeBound resource's kebab label for later
+  //                  annotated imports in this scope.
   // Snapshot the type / instance space sizes before validating the desc so we
   // can recover the new index allocated by a TypeBound (sub resource) or an
   // instance import and mark the imported resources as importable.
@@ -3520,6 +3520,14 @@ Expect<void> Validator::validate(const AST::Component::Import &Im) noexcept {
                  return E;
                }));
 
+  // Reject duplicate import names (strongly-unique across imports).
+  if (!CompCtx.addImportedName(CName)) {
+    spdlog::error(ErrCode::Value::ComponentImportNameConflict);
+    spdlog::error("    Import: Duplicate import name"sv);
+    spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Import));
+    return Unexpect(ErrCode::Value::ComponentImportNameConflict);
+  }
+
   // Enforce the annotated-name constraints ([constructor]/[method]/[static]
   // only on func imports; the named resource must be a preceding resource
   // import in this scope; constructor/method signature shape). Shared with the
@@ -3560,13 +3568,6 @@ Expect<void> Validator::validate(const AST::Component::Import &Im) noexcept {
         }
       }
     }
-  }
-
-  if (!CompCtx.addImportedName(CName)) {
-    spdlog::error(ErrCode::Value::ComponentImportNameConflict);
-    spdlog::error("    Import: Duplicate import name"sv);
-    spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Import));
-    return Unexpect(ErrCode::Value::ComponentImportNameConflict);
   }
 
   // If this import introduced a TypeBound resource with a label name,
@@ -4004,7 +4005,37 @@ Validator::validate(const AST::Component::ImportDecl &Decl) noexcept {
     }
   }
 
-  // A function imported here may only reference importable resources.
+  // name: parse and validate the import name.
+  EXPECTED_TRY(ComponentName CName,
+               ComponentName::parse(Decl.getName()).map_error(ReportError));
+
+  // dup: reject duplicate import names (strongly-unique across imports).
+  if (!CompCtx.addImportedName(CName)) {
+    spdlog::error(ErrCode::Value::ComponentImportNameConflict);
+    spdlog::error("    ImportDecl: Duplicate import name"sv);
+    spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Decl_Import));
+    return Unexpect(ErrCode::Value::ComponentImportNameConflict);
+  }
+
+  // annotated: enforce the annotated-name constraints (shared with the concrete
+  // import path so component-type / instance-type declarations behave
+  // identically).
+  {
+    const bool IsFunc = Decl.getExternDesc().getDescType() ==
+                        AST::Component::ExternDesc::DescType::FuncType;
+    const AST::Component::FuncType *FT = nullptr;
+    if (IsFunc) {
+      const auto *DT = CompCtx.getDefType(Decl.getExternDesc().getTypeIndex());
+      if (DT != nullptr && DT->isFuncType()) {
+        FT = &DT->getFuncType();
+      }
+    }
+    EXPECTED_TRY(
+        checkAnnotatedName(CompCtx, CName, IsFunc, FT, /*IsExport=*/false)
+            .map_error(ReportError));
+  }
+
+  // resource: a function imported here may only reference importable resources.
   if (Decl.getExternDesc().getDescType() ==
       AST::Component::ExternDesc::DescType::FuncType) {
     const auto *DT = CompCtx.getDefType(Decl.getExternDesc().getTypeIndex());
@@ -4022,29 +4053,8 @@ Validator::validate(const AST::Component::ImportDecl &Decl) noexcept {
     }
   }
 
-  // Parse and validate the import name.
-  EXPECTED_TRY(ComponentName CName,
-               ComponentName::parse(Decl.getName()).map_error(ReportError));
-
-  // Enforce the annotated-name constraints (shared with the concrete import
-  // path so component-type / instance-type declarations behave identically).
-  {
-    const bool IsFunc = Decl.getExternDesc().getDescType() ==
-                        AST::Component::ExternDesc::DescType::FuncType;
-    const AST::Component::FuncType *FT = nullptr;
-    if (IsFunc) {
-      const auto *DT = CompCtx.getDefType(Decl.getExternDesc().getTypeIndex());
-      if (DT != nullptr && DT->isFuncType()) {
-        FT = &DT->getFuncType();
-      }
-    }
-    EXPECTED_TRY(
-        checkAnnotatedName(CompCtx, CName, IsFunc, FT, /*IsExport=*/false)
-            .map_error(ReportError));
-  }
-
-  // Register a TypeBound resource import's kebab label in the import namespace
-  // so later annotated imports in this declaration scope can reference it.
+  // label: register a TypeBound resource import's kebab label in the import
+  // namespace so later annotated imports in this declaration scope resolve.
   if (Decl.getExternDesc().getDescType() ==
           AST::Component::ExternDesc::DescType::TypeBound &&
       CName.getKind() == ComponentNameKind::Label) {
@@ -4052,22 +4062,16 @@ Validator::validate(const AST::Component::ImportDecl &Decl) noexcept {
                              /*IsExport=*/false);
   }
 
-  // Check import name uniqueness.
-  if (!CompCtx.addImportedName(CName)) {
-    spdlog::error(ErrCode::Value::ComponentImportNameConflict);
-    spdlog::error("    ImportDecl: Duplicate import name"sv);
-    spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Decl_Import));
-    return Unexpect(ErrCode::Value::ComponentImportNameConflict);
-  }
-
   return {};
 }
 
 Expect<void>
 Validator::validate(const AST::Component::ExportDecl &Decl) noexcept {
-  // Check export name grammar and uniqueness before mutating the index
-  // spaces so a duplicate or malformed name doesn't widen the scope's
-  // sort counts.
+  // Same logical steps as Import/Export/ImportDecl (name, dup, bounds/propagate,
+  // annotated, resource, label), with one deliberate exception the export paths
+  // share: the name grammar + uniqueness are checked BEFORE the externdesc so a
+  // duplicate or malformed name doesn't widen the scope's sort counts. The
+  // annotated -> resource tail matches the concrete Export path.
   EXPECTED_TRY(ComponentName CName,
                validateExportName(Decl.getName()).map_error([](auto E) {
                  spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Decl_Export));
