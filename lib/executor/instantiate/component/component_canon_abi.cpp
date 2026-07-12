@@ -1327,8 +1327,20 @@ Expect<uint32_t> liftBorrow(const CanonCtx &Cx, uint32_t Handle,
 // receiver's table, charged to the current borrow scope, and return its index.
 Expect<uint32_t> lowerBorrow(const CanonCtx &Cx, uint32_t Rep,
                              const AST::Component::BorrowTy &T) noexcept {
+  const auto *Rt = resolveDefType(Cx, T.Idx);
+  // Same-instance fast path (definitions.py L1785): when lowering a borrow
+  // into the resource's own defining instance, the spec returns the bare
+  // representation without creating a handle or charging the borrow scope.
+  // This is the common case for resource methods - the defining component
+  // receives `self` directly as the rep (it never goes through resource.rep,
+  // which is only callable by the definer). Without it, the callee would get
+  // an opaque handle index where it expects the rep, and the unbalanced
+  // NumBorrows would falsely trap the Task.return_ borrow invariant.
+  if (Cx.CompInst != nullptr && Cx.CompInst->definesResource(Rt)) {
+    return Rep;
+  }
   RIC::ResourceHandle H{};
-  H.Rt = resolveDefType(Cx, T.Idx);
+  H.Rt = Rt;
   H.DefiningInst = Cx.CompInst;
   H.Rep = Rep;
   H.Own = false;

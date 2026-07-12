@@ -20,6 +20,13 @@ Executor::instantiate(Runtime::Instance::ComponentInstance &CompInst,
                       const AST::Component::TypeSection &TypeSec) {
   for (auto &Ty : TypeSec.getContent()) {
     CompInst.addType(Ty);
+    // A `(type (resource ...))` in this component's type section is a local
+    // resource definition: this instance is the resource's defining instance
+    // (the spec's `t.rt.impl`). Aliases/imports arrive via other paths and
+    // must not be recorded here.
+    if (Ty.isResourceType()) {
+      CompInst.markDefinedResource(&Ty);
+    }
   }
   return {};
 }

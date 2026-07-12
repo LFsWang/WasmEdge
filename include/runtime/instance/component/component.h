@@ -29,6 +29,7 @@
 #include <memory>
 #include <string>
 #include <type_traits>
+#include <unordered_set>
 #include <vector>
 
 namespace WasmEdge {
@@ -382,6 +383,20 @@ public:
     return HandleTable;
   }
 
+  // Record a resource type defined locally by this instance (a
+  // `(type (resource ...))` in this component's type section), so the
+  // canonical ABI can recognize the spec's `cx.inst is t.rt.impl`
+  // same-instance case. Aliases / imports of a resource are not recorded
+  // here - only genuine local definitions.
+  void markDefinedResource(const AST::Component::DefType *Rt) noexcept {
+    DefinedResources.insert(Rt);
+  }
+  // Whether this instance is the defining instance of resource type `Rt`
+  // (the spec's `t.rt.impl`).
+  bool definesResource(const AST::Component::DefType *Rt) const noexcept {
+    return DefinedResources.find(Rt) != DefinedResources.end();
+  }
+
 private:
   std::string CompName;
 
@@ -390,6 +405,9 @@ private:
 
   // Resource handle table (see getResourceTable).
   mutable Component::ResourceTable HandleTable;
+
+  // Resource types defined locally by this instance (see definesResource).
+  std::unordered_set<const AST::Component::DefType *> DefinedResources;
 
   // Index spaces.
   // The index spaces of AST should be cleaned after instantiation.

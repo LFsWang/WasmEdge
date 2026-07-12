@@ -51,6 +51,14 @@ struct BorrowScope {
 
   void addLender(ResourceHandle *H) noexcept;
   void resolve() noexcept;
+
+  // resolve() is idempotent (it clears `Lenders`), so running it from the
+  // destructor releases every lender's `NumLends` on all exit paths -
+  // including when the lowered call traps before the explicit resolve() is
+  // reached. Without this, a trapped borrowing call would leave the source
+  // handle's `NumLends` permanently > 0 and the resource could never be
+  // dropped.
+  ~BorrowScope() noexcept { resolve(); }
 };
 
 /// A single live resource handle. Mirrors definitions.py `class
