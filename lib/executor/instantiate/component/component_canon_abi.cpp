@@ -1281,18 +1281,24 @@ namespace RIC = Runtime::Instance::Component;
 Expect<uint32_t> liftOwn(const CanonCtx &Cx, uint32_t Handle,
                          const AST::Component::OwnTy &T) noexcept {
   const auto *Rt = resolveDefType(Cx, T.Idx);
-  EXPECTED_TRY(RIC::ResourceHandle H,
-               Cx.CompInst->getResourceTable().remove(Handle));
-  if (H.Rt != Rt) {
+  // Validate via get() before remove() frees the slot: a still-lent handle
+  // (NumLends != 0) must trap without being freed, otherwise the BorrowScope
+  // lenders that still point at it would dangle. The trap unwinds the call, so
+  // leaving the handle in the table is unobservable and matches the spec's
+  // remove-then-trap ordering.
+  EXPECTED_TRY(auto *H, Cx.CompInst->getResourceTable().get(Handle));
+  if (H->Rt != Rt) {
     EXPECTED_TRY(trapDataInvalid("own handle type mismatch"));
   }
-  if (H.NumLends != 0) {
+  if (H->NumLends != 0) {
     EXPECTED_TRY(trapDataInvalid("own handle still lent"));
   }
-  if (!H.Own) {
+  if (!H->Own) {
     EXPECTED_TRY(trapDataInvalid("expected own handle, got borrow"));
   }
-  return H.Rep;
+  EXPECTED_TRY(RIC::ResourceHandle Removed,
+               Cx.CompInst->getResourceTable().remove(Handle));
+  return Removed.Rep;
 }
 
 // lower_own (definitions.py L2306-2308): create a fresh owning handle in the

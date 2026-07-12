@@ -62,29 +62,41 @@ Expect<void> CanonResourceHostFunc::run(const Runtime::CallingFrame &,
     return {};
   }
   case ResourceOp::Drop: {
-    // canon_resource_drop: remove the handle, run the destructor (own) or
-    // release the borrow (borrow).
-    EXPECTED_TRY(Component::ResourceHandle H, Table.remove(Arg));
-    if (H.Rt != ResType) {
+    // canon_resource_drop: validate the handle, then remove it, run the
+    // destructor (own) or release the borrow (borrow). The traps are checked
+    // via get() before remove() frees the slot: a still-lent handle
+    // (NumLends != 0) must trap without being freed, otherwise the BorrowScope
+    // lenders that still point at it would dangle. On a trap the whole call
+    // unwinds, so leaving the handle in the table is unobservable and matches
+    // the spec's remove-then-trap ordering.
+    EXPECTED_TRY(auto *H, Table.get(Arg));
+    if (H->Rt != ResType) {
       spdlog::error(ErrCode::Value::ComponentTrap);
       spdlog::error("    canonical ABI: resource.drop type mismatch"sv);
       return Unexpect(ErrCode::Value::ComponentTrap);
     }
-    if (H.NumLends != 0) {
+    if (H->NumLends != 0) {
       spdlog::error(ErrCode::Value::ComponentTrap);
       spdlog::error("    canonical ABI: resource.drop of lent handle"sv);
       return Unexpect(ErrCode::Value::ComponentTrap);
     }
-    if (H.Own) {
+    EXPECTED_TRY(Component::ResourceHandle Removed, Table.remove(Arg));
+    if (Removed.Own) {
       auto Dtor = ResType->getResourceType().getDestructor();
       if (Dtor.has_value()) {
-        auto *DtorFn = H.DefiningInst->getCoreFunction(*Dtor);
-        std::array<ValVariant, 1> DArgs{ValVariant(H.Rep)};
+        auto *DtorFn = Removed.DefiningInst->getCoreFunction(*Dtor);
+        if (DtorFn == nullptr) {
+          spdlog::error(ErrCode::Value::ComponentTrap);
+          spdlog::error(
+              "    canonical ABI: resource.drop destructor index out of range"sv);
+          return Unexpect(ErrCode::Value::ComponentTrap);
+        }
+        std::array<ValVariant, 1> DArgs{ValVariant(Removed.Rep)};
         auto ParamTypes = DtorFn->getFuncType().getParamTypes();
         EXPECTED_TRY(Exec->invoke(DtorFn, DArgs, ParamTypes));
       }
-    } else if (H.Scope != nullptr) {
-      H.Scope->NumBorrows--;
+    } else if (Removed.Scope != nullptr) {
+      Removed.Scope->NumBorrows--;
     }
     return {};
   }

@@ -281,6 +281,9 @@ public:
     OwnedAuxModInsts.push_back(std::move(Mod));
   }
   FunctionInstance *getCoreFunction(uint32_t Index) const noexcept {
+    if (Index >= CoreFuncInsts.size()) {
+      return nullptr;
+    }
     return CoreFuncInsts[Index];
   }
   void exportCoreFunction(std::string_view Name, uint32_t Idx) noexcept {
