@@ -396,6 +396,14 @@ public:
   }
   // Whether this instance is the defining instance of resource type `Rt`
   // (the spec's `t.rt.impl`).
+  //
+  // TODO: COMPONENT - identity keys on the AST `DefType *`, which is shared
+  // across every instantiation of the same component. Once a sub-component can
+  // be instantiated more than once (or across components), two sibling
+  // instances register the identical pointer, so this check can mis-classify a
+  // sibling's resource as same-instance. The spec makes each instantiation's
+  // resource a distinct ResourceType; switch to per-instance identity when
+  // multi-instantiation of resource-defining components lands.
   bool definesResource(const AST::Component::DefType *Rt) const noexcept {
     return DefinedResources.find(Rt) != DefinedResources.end();
   }

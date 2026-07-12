@@ -1307,6 +1307,13 @@ Expect<uint32_t> lowerOwn(const CanonCtx &Cx, uint32_t Rep,
                           const AST::Component::OwnTy &T) noexcept {
   RIC::ResourceHandle H{};
   H.Rt = resolveDefType(Cx, T.Idx);
+  // TODO: COMPONENT - DefiningInst is set to the receiver, which equals the
+  // resource's defining instance only in the single-component case. Once
+  // instantiating a sub-component that imports a resource is supported, an own
+  // handle can be transferred to a non-defining instance and dropped there; the
+  // destructor must still run in the resource's defining instance (rt.impl, per
+  // definitions.py L2293). Resolve the destructor from a DefType* -> defining
+  // ComponentInstance* lookup at drop time instead of trusting this field.
   H.DefiningInst = Cx.CompInst;
   H.Rep = Rep;
   H.Own = true;
