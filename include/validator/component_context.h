@@ -184,8 +184,13 @@ public:
     std::unordered_set<std::string> ImportedNames;
     std::unordered_set<std::string> ExportedNames;
     // Kebab-case resource name → type-idx; consumed by annotated-name
-    // validation ([constructor]R / [method]R.f / [static]R.f).
-    std::unordered_map<std::string, uint32_t> ResourceLabels;
+    // validation ([constructor]R / [method]R.f / [static]R.f). Import and
+    // export labels live in separate namespaces: Binary.md "annotated names"
+    // requires a `[constructor]/[method]/[static]` import to match a preceding
+    // resource import and an annotated export to match a resource export,
+    // respectively.
+    std::unordered_map<std::string, uint32_t> ImportResourceLabels;
+    std::unordered_map<std::string, uint32_t> ExportResourceLabels;
 
     // ---- Size queries (used by outer-alias validation on parent ctxs) ----
     uint32_t getSortIndexSize(AST::Component::Sort::SortType ST) const noexcept;
@@ -619,21 +624,29 @@ public:
     return It == M.end() ? nullptr : &It->second;
   }
 
-  /// Register a kebab-case resource name (from a TypeBound import / export)
-  /// so annotated names ([constructor]R / [method]R.f / [static]R.f) resolve.
-  void addResourceLabel(std::string_view Name, uint32_t TypeIdx) noexcept {
-    getCurrentContext().ResourceLabels.emplace(std::string(Name), TypeIdx);
+  /// Register a kebab-case resource name (from a TypeBound import / export) so
+  /// annotated names ([constructor]R / [method]R.f / [static]R.f) resolve. The
+  /// import and export namespaces are kept separate so an annotated name only
+  /// matches a preceding resource declared in the same direction (Binary.md
+  /// "annotated names", the "respectively" rule).
+  void addResourceLabel(std::string_view Name, uint32_t TypeIdx,
+                        bool IsExport) noexcept {
+    auto &M = IsExport ? getCurrentContext().ExportResourceLabels
+                       : getCurrentContext().ImportResourceLabels;
+    M.emplace(std::string(Name), TypeIdx);
   }
 
-  bool hasResourceLabel(std::string_view Name) const noexcept {
-    return getCurrentContext().ResourceLabels.find(std::string(Name)) !=
-           getCurrentContext().ResourceLabels.end();
+  bool hasResourceLabel(std::string_view Name, bool IsExport) const noexcept {
+    const auto &M = IsExport ? getCurrentContext().ExportResourceLabels
+                             : getCurrentContext().ImportResourceLabels;
+    return M.find(std::string(Name)) != M.end();
   }
 
   // Resolve a kebab resource label to its type index, if present.
-  std::optional<uint32_t>
-  getResourceLabel(std::string_view Name) const noexcept {
-    const auto &M = getCurrentContext().ResourceLabels;
+  std::optional<uint32_t> getResourceLabel(std::string_view Name,
+                                           bool IsExport) const noexcept {
+    const auto &M = IsExport ? getCurrentContext().ExportResourceLabels
+                             : getCurrentContext().ImportResourceLabels;
     auto It = M.find(std::string(Name));
     if (It == M.end()) {
       return std::nullopt;

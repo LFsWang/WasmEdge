@@ -793,9 +793,10 @@ std::vector<uint32_t> funcResourceIndices(const ComponentContext &Ctx,
 Expect<void>
 validateAnnotatedFuncSig(const ComponentContext &Ctx,
                          const ComponentName &CName,
-                         const AST::Component::FuncType &FT) noexcept {
+                         const AST::Component::FuncType &FT,
+                         bool IsExport) noexcept {
   auto wantId = [&](std::string_view Label) -> std::optional<uint64_t> {
-    if (auto Idx = Ctx.getResourceLabel(Label)) {
+    if (auto Idx = Ctx.getResourceLabel(Label, IsExport)) {
       if (const auto *R = Ctx.getResource(*Idx)) {
         return R->Id;
       }
@@ -851,6 +852,87 @@ validateAnnotatedFuncSig(const ComponentContext &Ctx,
       spdlog::error(ErrCode::Value::ComponentMethodResourceMismatch);
       spdlog::error("    [method] `self` resource does not match name"sv);
       return Unexpect(ErrCode::Value::ComponentMethodResourceMismatch);
+    }
+  }
+  return {};
+}
+
+// The kebab resource label a [constructor]/[method]/[static] name refers to,
+// or empty for a non-annotated name.
+std::string_view annotatedResourceLabel(const ComponentName &CName) noexcept {
+  switch (CName.getKind()) {
+  case ComponentNameKind::Constructor:
+    return CName.getDetail().get<ConstructorDetail>().Label;
+  case ComponentNameKind::Method:
+    return CName.getDetail().get<MethodDetail>().Resource;
+  case ComponentNameKind::Static:
+    return CName.getDetail().get<StaticDetail>().Resource;
+  default:
+    return {};
+  }
+}
+
+// Shared validation of an annotated plainname ([constructor]/[method]/[static])
+// on an import or export, so all four import/export paths behave identically
+// (Binary.md "annotated names"):
+//   - annotated names may only occur on `func` imports/exports;
+//   - the named resource must be a preceding `resource` declared in the same
+//     direction and scope (the "respectively" rule: an annotated import matches
+//     a resource import, an annotated export a resource export);
+//   - [constructor]/[method] signatures have the shape the annotation requires.
+// `IsFunc`/`FT` describe the annotated entity's externdesc; `FT` may be null
+// when the func-type body is not resolvable in this scope (the signature check
+// is then skipped, matching the pre-existing behavior).
+Expect<void> checkAnnotatedName(const ComponentContext &Ctx,
+                                const ComponentName &CName, bool IsFunc,
+                                const AST::Component::FuncType *FT,
+                                bool IsExport) noexcept {
+  switch (CName.getKind()) {
+  case ComponentNameKind::Constructor:
+  case ComponentNameKind::Method:
+  case ComponentNameKind::Static:
+    break;
+  default:
+    return {};
+  }
+  if (!IsFunc) {
+    spdlog::error(ErrCode::Value::ComponentInvalidName);
+    spdlog::error("    annotated name requires func type"sv);
+    return Unexpect(ErrCode::Value::ComponentInvalidName);
+  }
+  const std::string_view Label = annotatedResourceLabel(CName);
+  if (!Label.empty() && !Ctx.hasResourceLabel(Label, IsExport)) {
+    spdlog::error(ErrCode::Value::ComponentInvalidName);
+    spdlog::error("    annotated name references unknown resource '{}'"sv,
+                  Label);
+    return Unexpect(ErrCode::Value::ComponentInvalidName);
+  }
+  if ((CName.getKind() == ComponentNameKind::Constructor ||
+       CName.getKind() == ComponentNameKind::Method) &&
+      FT != nullptr) {
+    EXPECTED_TRY(validateAnnotatedFuncSig(Ctx, CName, *FT, IsExport));
+  }
+  return {};
+}
+
+// Binary.md:404-405: every resource type transitively used in the type of an
+// export must be introduced by a preceding import or export (direction-
+// agnostic). A resource that is locally defined but never exported has no name
+// in the export context and is rejected; imported or exported resources are
+// fine. Shared by the concrete `export` and the `exportdecl` paths.
+Expect<void>
+checkExportResourceNameable(const ComponentContext &Ctx,
+                            const std::vector<uint32_t> &ResIndices) noexcept {
+  for (uint32_t RIdx : ResIndices) {
+    const auto *RInfo = Ctx.getResource(RIdx);
+    if (RInfo == nullptr) {
+      continue;
+    }
+    if (RInfo->LocallyDefined && !Ctx.isResourceExported(RInfo->Id)) {
+      spdlog::error(ErrCode::Value::InvalidTypeReference);
+      spdlog::error("    Export: type references a resource with no name in "
+                    "the export context"sv);
+      return Unexpect(ErrCode::Value::InvalidTypeReference);
     }
   }
   return {};
@@ -3438,69 +3520,26 @@ Expect<void> Validator::validate(const AST::Component::Import &Im) noexcept {
                  return E;
                }));
 
-  // Annotated plainnames ([constructor], [method], [static]) can only appear
-  // on func imports.
-  switch (CName.getKind()) {
-  case ComponentNameKind::Constructor:
-  case ComponentNameKind::Method:
-  case ComponentNameKind::Static:
-    if (Im.getDesc().getDescType() !=
-        AST::Component::ExternDesc::DescType::FuncType) {
-      spdlog::error(ErrCode::Value::ComponentInvalidName);
-      spdlog::error("    Import: annotated name requires func type"sv);
-      spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Import));
-      return Unexpect(ErrCode::Value::ComponentInvalidName);
+  // Enforce the annotated-name constraints ([constructor]/[method]/[static]
+  // only on func imports; the named resource must be a preceding resource
+  // import in this scope; constructor/method signature shape). Shared with the
+  // export and declaration paths via checkAnnotatedName.
+  {
+    const bool IsFunc = Im.getDesc().getDescType() ==
+                        AST::Component::ExternDesc::DescType::FuncType;
+    const AST::Component::FuncType *FT = nullptr;
+    if (IsFunc) {
+      const auto *DT = CompCtx.getDefType(Im.getDesc().getTypeIndex());
+      if (DT != nullptr && DT->isFuncType()) {
+        FT = &DT->getFuncType();
+      }
     }
-    break;
-  default:
-    break;
-  }
-
-  // Resolve the resource name referenced by an annotated name. The resource
-  // must have been previously introduced by a TypeBound import or export
-  // with a kebab-case label in this scope.
-  // TODO: extend to the full structural checks once func-type bodies are
-  // walked here:
-  //   - [constructor]R: result type must be (own $R).
-  //   - [method]R.f:    first param must be (borrow $R).
-  //   - [static]R.f:    no `self` param of (borrow $R).
-  std::string_view ResourceLabel;
-  switch (CName.getKind()) {
-  case ComponentNameKind::Constructor:
-    ResourceLabel = CName.getDetail().get<ConstructorDetail>().Label;
-    break;
-  case ComponentNameKind::Method:
-    ResourceLabel = CName.getDetail().get<MethodDetail>().Resource;
-    break;
-  case ComponentNameKind::Static:
-    ResourceLabel = CName.getDetail().get<StaticDetail>().Resource;
-    break;
-  default:
-    break;
-  }
-  if (!ResourceLabel.empty() && !CompCtx.hasResourceLabel(ResourceLabel)) {
-    spdlog::error(ErrCode::Value::ComponentInvalidName);
-    spdlog::error(
-        "    Import: annotated name references unknown resource '{}'"sv,
-        ResourceLabel);
-    spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Import));
-    return Unexpect(ErrCode::Value::ComponentInvalidName);
-  }
-
-  // Validate the annotated function's signature against the resource it names.
-  if ((CName.getKind() == ComponentNameKind::Constructor ||
-       CName.getKind() == ComponentNameKind::Method) &&
-      Im.getDesc().getDescType() ==
-          AST::Component::ExternDesc::DescType::FuncType) {
-    const auto *DT = CompCtx.getDefType(Im.getDesc().getTypeIndex());
-    if (DT != nullptr && DT->isFuncType()) {
-      EXPECTED_TRY(validateAnnotatedFuncSig(CompCtx, CName, DT->getFuncType())
-                       .map_error([](auto E) {
-                         spdlog::error(
-                             ErrInfo::InfoAST(ASTNodeAttr::Comp_Import));
-                         return E;
-                       }));
-    }
+    EXPECTED_TRY(
+        checkAnnotatedName(CompCtx, CName, IsFunc, FT, /*IsExport=*/false)
+            .map_error([](auto E) {
+              spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Import));
+              return E;
+            }));
   }
 
   // A function imported into this component may only reference resources that
@@ -3531,11 +3570,12 @@ Expect<void> Validator::validate(const AST::Component::Import &Im) noexcept {
   }
 
   // If this import introduced a TypeBound resource with a label name,
-  // register the label so subsequent annotated names can reference it.
+  // register the label in the import namespace so subsequent annotated imports
+  // can reference it.
   if (Im.getDesc().getDescType() ==
           AST::Component::ExternDesc::DescType::TypeBound &&
       CName.getKind() == ComponentNameKind::Label) {
-    CompCtx.addResourceLabel(Im.getName(), TypeSpaceBefore);
+    CompCtx.addResourceLabel(Im.getName(), TypeSpaceBefore, /*IsExport=*/false);
   }
 
   return {};
@@ -3698,52 +3738,51 @@ Expect<void> Validator::validate(const AST::Component::Export &Ex) noexcept {
         CompCtx.addResource(NewIdx, {RInfo->Id, RInfo->LocallyDefined});
         CompCtx.markResourceExported(RInfo->Id);
         if (CName.getKind() == ComponentNameKind::Label) {
-          CompCtx.addResourceLabel(Ex.getName(), NewIdx);
-        }
-      }
-    } else if (Sort.getSortType() == AST::Component::Sort::SortType::Func) {
-      // An annotated export ([constructor]/[method]) must additionally have the
-      // shape the annotation requires (return `(own $R)`, `self` as
-      // `(borrow $R)`); the rule applies to exports as well as imports.
-      if (CName.getKind() == ComponentNameKind::Constructor ||
-          CName.getKind() == ComponentNameKind::Method) {
-        if (const auto *FT = CompCtx.getFunc(Idx)) {
-          EXPECTED_TRY(validateAnnotatedFuncSig(CompCtx, CName, *FT)
-                           .map_error([](auto E) {
-                             spdlog::error(
-                                 ErrInfo::InfoAST(ASTNodeAttr::Comp_Export));
-                             return E;
-                           }));
-        }
-      }
-      // A function exported from this component must have its resources named
-      // in the export context: a plain export may use imported or exported
-      // resources but not a locally-defined unexported one; an annotated
-      // export ([constructor]/[method]/[static]) requires the resource to be
-      // exported (it must be nameable by the annotation in this context).
-      const bool Annotated =
-          CName.getKind() == ComponentNameKind::Constructor ||
-          CName.getKind() == ComponentNameKind::Method ||
-          CName.getKind() == ComponentNameKind::Static;
-      if (const auto *FT = CompCtx.getFunc(Idx)) {
-        for (uint32_t RIdx : funcResourceIndices(CompCtx, *FT)) {
-          const auto *RInfo = CompCtx.getResource(RIdx);
-          if (RInfo == nullptr) {
-            continue;
-          }
-          const bool Exported = CompCtx.isResourceExported(RInfo->Id);
-          const bool Bad =
-              Annotated ? !Exported : (RInfo->LocallyDefined && !Exported);
-          if (Bad) {
-            spdlog::error(ErrCode::Value::InvalidTypeReference);
-            spdlog::error("    Export: function references a resource with no "
-                          "name in the export context"sv);
-            spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Export));
-            return Unexpect(ErrCode::Value::InvalidTypeReference);
-          }
+          CompCtx.addResourceLabel(Ex.getName(), NewIdx, /*IsExport=*/true);
         }
       }
     }
+  }
+
+  // Enforce the annotated-name constraints and the export resource-avoidance
+  // rule uniformly for every (non-core) export sort, shared with the import and
+  // declaration paths. Placing this after the index-space block means a
+  // preceding resource export in this scope is already registered.
+  if (!Sort.isCore()) {
+    const bool IsFunc =
+        Sort.getSortType() == AST::Component::Sort::SortType::Func;
+    const AST::Component::FuncType *FT = IsFunc ? CompCtx.getFunc(Idx) : nullptr;
+    // Binary.md "annotated names": annotated plainnames only on func exports;
+    // the named resource must be a preceding resource export in this scope;
+    // constructor/method signatures have the required shape.
+    EXPECTED_TRY(
+        checkAnnotatedName(CompCtx, CName, IsFunc, FT, /*IsExport=*/true)
+            .map_error([](auto E) {
+              spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Export));
+              return E;
+            }));
+    // Binary.md:404-405: every resource transitively used in the type of an
+    // export must be introduced by a preceding import or export. Cover funcs
+    // and defvaltype exports; a bare resource-type export introduces the
+    // resource itself and needs no check.
+    std::vector<uint32_t> ExpResources;
+    if (IsFunc && FT != nullptr) {
+      ExpResources = funcResourceIndices(CompCtx, *FT);
+    } else if (Sort.getSortType() == AST::Component::Sort::SortType::Type) {
+      if (const auto *DT = CompCtx.getDefType(Idx)) {
+        if (DT->isFuncType()) {
+          ExpResources = funcResourceIndices(CompCtx, DT->getFuncType());
+        } else if (DT->isDefValType()) {
+          collectDefValTypeResources(CompCtx, DT->getDefValType(), ExpResources,
+                                     0);
+        }
+      }
+    }
+    EXPECTED_TRY(checkExportResourceNameable(CompCtx, ExpResources)
+                     .map_error([](auto E) {
+                       spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Export));
+                       return E;
+                     }));
   }
   return {};
 }
@@ -3987,71 +4026,30 @@ Validator::validate(const AST::Component::ImportDecl &Decl) noexcept {
   EXPECTED_TRY(ComponentName CName,
                ComponentName::parse(Decl.getName()).map_error(ReportError));
 
-  // Annotated plainnames can only appear on func imports.
-  switch (CName.getKind()) {
-  case ComponentNameKind::Constructor:
-  case ComponentNameKind::Method:
-  case ComponentNameKind::Static:
-    if (Decl.getExternDesc().getDescType() !=
-        AST::Component::ExternDesc::DescType::FuncType) {
-      spdlog::error(ErrCode::Value::ComponentInvalidName);
-      spdlog::error("    ImportDecl: annotated name requires func type"sv);
-      spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Decl_Import));
-      return Unexpect(ErrCode::Value::ComponentInvalidName);
+  // Enforce the annotated-name constraints (shared with the concrete import
+  // path so component-type / instance-type declarations behave identically).
+  {
+    const bool IsFunc = Decl.getExternDesc().getDescType() ==
+                        AST::Component::ExternDesc::DescType::FuncType;
+    const AST::Component::FuncType *FT = nullptr;
+    if (IsFunc) {
+      const auto *DT = CompCtx.getDefType(Decl.getExternDesc().getTypeIndex());
+      if (DT != nullptr && DT->isFuncType()) {
+        FT = &DT->getFuncType();
+      }
     }
-    break;
-  default:
-    break;
+    EXPECTED_TRY(
+        checkAnnotatedName(CompCtx, CName, IsFunc, FT, /*IsExport=*/false)
+            .map_error(ReportError));
   }
 
-  // An annotated name must reference a resource in scope (mirrors the concrete
-  // import path so component-type declarations are validated too).
-  std::string_view ResourceLabel;
-  switch (CName.getKind()) {
-  case ComponentNameKind::Constructor:
-    ResourceLabel = CName.getDetail().get<ConstructorDetail>().Label;
-    break;
-  case ComponentNameKind::Method:
-    ResourceLabel = CName.getDetail().get<MethodDetail>().Resource;
-    break;
-  case ComponentNameKind::Static:
-    ResourceLabel = CName.getDetail().get<StaticDetail>().Resource;
-    break;
-  default:
-    break;
-  }
-  if (!ResourceLabel.empty() && !CompCtx.hasResourceLabel(ResourceLabel)) {
-    spdlog::error(ErrCode::Value::ComponentInvalidName);
-    spdlog::error(
-        "    ImportDecl: annotated name references unknown resource '{}'"sv,
-        ResourceLabel);
-    spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Decl_Import));
-    return Unexpect(ErrCode::Value::ComponentInvalidName);
-  }
-
-  // Validate the annotated function's signature against the resource it names
-  // (the rule applies inside component-type / instance-type declarations too).
-  if ((CName.getKind() == ComponentNameKind::Constructor ||
-       CName.getKind() == ComponentNameKind::Method) &&
-      Decl.getExternDesc().getDescType() ==
-          AST::Component::ExternDesc::DescType::FuncType) {
-    const auto *DT = CompCtx.getDefType(Decl.getExternDesc().getTypeIndex());
-    if (DT != nullptr && DT->isFuncType()) {
-      EXPECTED_TRY(validateAnnotatedFuncSig(CompCtx, CName, DT->getFuncType())
-                       .map_error([](auto E) {
-                         spdlog::error(
-                             ErrInfo::InfoAST(ASTNodeAttr::Comp_Decl_Import));
-                         return E;
-                       }));
-    }
-  }
-
-  // Register a TypeBound resource import's kebab label so later annotated
-  // names in this declaration scope can reference it.
+  // Register a TypeBound resource import's kebab label in the import namespace
+  // so later annotated imports in this declaration scope can reference it.
   if (Decl.getExternDesc().getDescType() ==
           AST::Component::ExternDesc::DescType::TypeBound &&
       CName.getKind() == ComponentNameKind::Label) {
-    CompCtx.addResourceLabel(Decl.getName(), TypeSpaceBefore);
+    CompCtx.addResourceLabel(Decl.getName(), TypeSpaceBefore,
+                             /*IsExport=*/false);
   }
 
   // Check import name uniqueness.
@@ -4097,20 +4095,44 @@ Validator::validate(const AST::Component::ExportDecl &Decl) noexcept {
     return E;
   }));
 
-  // Validate the annotated function's signature shape (return `(own $R)`,
-  // `self` as `(borrow $R)`); the rule applies to exported declarations too.
-  if ((CName.getKind() == ComponentNameKind::Constructor ||
-       CName.getKind() == ComponentNameKind::Method) &&
-      Decl.getExternDesc().getDescType() ==
-          AST::Component::ExternDesc::DescType::FuncType) {
-    const auto *DT = CompCtx.getDefType(Decl.getExternDesc().getTypeIndex());
-    if (DT != nullptr && DT->isFuncType()) {
-      EXPECTED_TRY(validateAnnotatedFuncSig(CompCtx, CName, DT->getFuncType())
-                       .map_error([](auto E) {
-                         spdlog::error(
-                             ErrInfo::InfoAST(ASTNodeAttr::Comp_Decl_Export));
-                         return E;
-                       }));
+  auto ReportError = [](auto E) {
+    spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Decl_Export));
+    return E;
+  };
+
+  // Register an exported resource type's kebab label in the export namespace so
+  // later annotated exports in this declaration scope can reference it (mirrors
+  // the concrete Export path). validate(ExternDesc) appends the new type slot,
+  // so the resource lives at the last type index.
+  if (Decl.getExternDesc().getDescType() ==
+          AST::Component::ExternDesc::DescType::TypeBound &&
+      CName.getKind() == ComponentNameKind::Label) {
+    const uint32_t TypeSize =
+        CompCtx.getSortIndexSize(AST::Component::Sort::SortType::Type);
+    if (TypeSize > 0 && CompCtx.getResource(TypeSize - 1) != nullptr) {
+      CompCtx.addResourceLabel(Decl.getName(), TypeSize - 1, /*IsExport=*/true);
+    }
+  }
+
+  // Enforce the annotated-name constraints (shared with the concrete export
+  // path) and the export resource-avoidance rule.
+  {
+    const bool IsFunc = Decl.getExternDesc().getDescType() ==
+                        AST::Component::ExternDesc::DescType::FuncType;
+    const AST::Component::FuncType *FT = nullptr;
+    if (IsFunc) {
+      const auto *DT = CompCtx.getDefType(Decl.getExternDesc().getTypeIndex());
+      if (DT != nullptr && DT->isFuncType()) {
+        FT = &DT->getFuncType();
+      }
+    }
+    EXPECTED_TRY(
+        checkAnnotatedName(CompCtx, CName, IsFunc, FT, /*IsExport=*/true)
+            .map_error(ReportError));
+    if (FT != nullptr) {
+      EXPECTED_TRY(
+          checkExportResourceNameable(CompCtx, funcResourceIndices(CompCtx, *FT))
+              .map_error(ReportError));
     }
   }
 
