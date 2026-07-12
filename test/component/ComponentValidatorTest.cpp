@@ -708,6 +708,66 @@ TEST(ComponentValidatorTest, InstanceTypeExportConstructorPlainAllowed) {
   ASSERT_TRUE(V.validate(Comp));
 }
 
+TEST(ComponentValidatorTest, InstanceTypeExportAnnotatedNameMissingResourceRejected) {
+  // (type (instance
+  //   (export "s" (type (sub resource)))         ;; type 0: resource s
+  //   (type (func (param "self" (borrow 0))))    ;; type 1: valid method sig
+  //   (export "[method]r.foo" (func (type 1)))   ;; FAIL: no resource "r"
+  // ))
+  // The signature is a well-formed [method] shape (`self: (borrow $s)`), so it
+  // alone does not reject. The annotated name, however, names resource `r`,
+  // which is not in scope (only `s` is). Before the export-path fix this was
+  // wrongly accepted because the signature check skips resource-identity
+  // matching when the named resource does not resolve (Binary.md "annotated
+  // names").
+  AST::Component::Component Comp;
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::TypeSection>();
+  auto &TypeSec =
+      std::get<AST::Component::TypeSection>(Comp.getSections().back());
+
+  std::vector<AST::Component::InstanceDecl> Decls;
+  // export "s" (type (sub resource)) -- instancetype-local type idx 0.
+  {
+    AST::Component::ExportDecl Exp;
+    Exp.getName() = "s";
+    Exp.getExternDesc().setTypeBound();
+    AST::Component::InstanceDecl D;
+    D.setExport(std::move(Exp));
+    Decls.push_back(std::move(D));
+  }
+  // Method func type `(func (param "self" (borrow 0)))` at type idx 1.
+  {
+    auto DT = std::make_unique<AST::Component::DefType>();
+    AST::Component::FuncType FT;
+    std::vector<AST::Component::LabelValType> Params;
+    Params.emplace_back("self"s,
+                        ComponentValType(ComponentTypeCode::Borrow, 0));
+    FT.setParamList(std::move(Params));
+    DT->setFuncType(std::move(FT));
+    AST::Component::InstanceDecl FtDecl;
+    FtDecl.setType(std::move(DT));
+    Decls.push_back(std::move(FtDecl));
+  }
+  // export "[method]r.foo" naming a resource "r" that is not in scope.
+  {
+    AST::Component::ExportDecl Exp;
+    Exp.getName() = "[method]r.foo";
+    Exp.getExternDesc().setFuncTypeIdx(1);
+    AST::Component::InstanceDecl D;
+    D.setExport(std::move(Exp));
+    Decls.push_back(std::move(D));
+  }
+
+  AST::Component::InstanceType IT;
+  IT.setDecl(std::move(Decls));
+  TypeSec.getContent().emplace_back();
+  TypeSec.getContent().back().setInstanceType(std::move(IT));
+
+  Validator::Validator V(Conf);
+  EXPECT_FALSE(V.validate(Comp));
+}
+
 TEST(ComponentValidatorTest, InstanceTypeExportMethodSelfDotConflict) {
   // (type (instance
   //   (export "foo" (func))
