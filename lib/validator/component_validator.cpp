@@ -2249,6 +2249,29 @@ Validator::validate(const AST::Component::Instance &Inst) noexcept {
       }
     }
 
+    // Value linearity (Binary.md): a value is consumed when used via export,
+    // instantiate, or start. Each value-sort instantiation argument therefore
+    // consumes its value exactly once; reusing an already-consumed value here
+    // or across instantiations is a linearity violation.
+    for (const auto &Arg : Args) {
+      const auto &ArgSort = Arg.getIndex().getSort();
+      if (ArgSort.isCore() ||
+          ArgSort.getSortType() != AST::Component::Sort::SortType::Value) {
+        continue;
+      }
+      const uint32_t VIdx = Arg.getIndex().getIdx();
+      if (auto Res = CompCtx.consumeValue(VIdx); !Res) {
+        spdlog::error(Res.error());
+        spdlog::error(
+            Res.error() == ErrCode::Value::ComponentValueAlreadyConsumed
+                ? "    Instance: value argument index {} has already been consumed"sv
+                : "    Instance: value argument index {} is out of value index space bounds"sv,
+            VIdx);
+        spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Instance));
+        return Unexpect(Res.error());
+      }
+    }
+
     // Allocate the slot + populate exports so alias-export can resolve.
     // Raw-Component path resolves the IT for instance-typed exports;
     // ComponentType path registers sort-kind only (GAP-DECL-ED).
@@ -2453,6 +2476,20 @@ Validator::validate(const AST::Component::Instance &Inst) noexcept {
             Export.getName(), Idx);
         spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Instance));
         return Unexpect(ErrCode::Value::InvalidIndex);
+      }
+      // Value linearity (Binary.md): bundling a value into an inline-export
+      // (bag-of-exports) instance uses it, so it is consumed exactly once here.
+      if (Sort.getSortType() == AST::Component::Sort::SortType::Value) {
+        if (auto Res = CompCtx.consumeValue(Idx); !Res) {
+          spdlog::error(Res.error());
+          spdlog::error(
+              Res.error() == ErrCode::Value::ComponentValueAlreadyConsumed
+                  ? "    Instance: inline export '{}' reuses an already-consumed value"sv
+                  : "    Instance: inline export '{}' refers to an invalid value index"sv,
+              Export.getName());
+          spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Instance));
+          return Unexpect(Res.error());
+        }
       }
       // An inline-export instance (bag-of-exports) freshens the resources it
       // exports, so an externally-defined function bundled under an annotated

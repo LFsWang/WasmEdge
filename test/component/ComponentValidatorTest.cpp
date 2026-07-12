@@ -2830,4 +2830,169 @@ TEST(ComponentValidatorTest, StartArgumentValueIndexOutOfBounds) {
   EXPECT_EQ(Res.error(), ErrCode::Value::InvalidIndex);
 }
 
+// Build a child component that imports a value "v" and consumes it via an
+// export "ev", so it is self-consistent when instantiated.
+static void
+addValuePassthroughChild(AST::Component::ComponentSection &CompSec) {
+  CompSec.getContent() = std::make_unique<AST::Component::Component>();
+  auto &Child = *CompSec.getContent();
+  Child.getSections().emplace_back();
+  Child.getSections().back().emplace<AST::Component::ImportSection>();
+  auto &CImp =
+      std::get<AST::Component::ImportSection>(Child.getSections().back());
+  CImp.getContent().emplace_back();
+  CImp.getContent().back().getName() = "v";
+  CImp.getContent().back().getDesc().setValueBound(
+      ComponentValType(ComponentTypeCode::U32));
+
+  Child.getSections().emplace_back();
+  Child.getSections().back().emplace<AST::Component::ExportSection>();
+  auto &CExp =
+      std::get<AST::Component::ExportSection>(Child.getSections().back());
+  CExp.getContent().emplace_back();
+  CExp.getContent().back().getName() = "ev";
+  CExp.getContent().back().getSortIndex().getSort().setIsCore(false);
+  CExp.getContent().back().getSortIndex().getSort().setSortType(
+      AST::Component::Sort::SortType::Value);
+  CExp.getContent().back().getSortIndex().setIdx(0);
+}
+
+static AST::Component::InstantiateArg<AST::Component::SortIndex>
+makeValueArg(std::string Name, uint32_t ValueIdx) {
+  AST::Component::InstantiateArg<AST::Component::SortIndex> Arg;
+  Arg.getName() = std::move(Name);
+  Arg.getIndex().getSort().setIsCore(false);
+  Arg.getIndex().getSort().setSortType(AST::Component::Sort::SortType::Value);
+  Arg.getIndex().setIdx(ValueIdx);
+  return Arg;
+}
+
+TEST(ComponentValidatorTest, ValueConsumedByInstantiation) {
+  // Import a value and pass it to a child instantiation -> the value is
+  // consumed by the instantiate, so the component validates (wasm-tools: valid;
+  // previously rejected with ComponentValueNotConsumed).
+  AST::Component::Component Comp;
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::ComponentSection>();
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::ImportSection>();
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::InstanceSection>();
+
+  addValuePassthroughChild(
+      std::get<AST::Component::ComponentSection>(Comp.getSections()[0]));
+
+  auto &ImpSec = std::get<AST::Component::ImportSection>(Comp.getSections()[1]);
+  ImpSec.getContent().emplace_back();
+  ImpSec.getContent().back().getName() = "val0";
+  ImpSec.getContent().back().getDesc().setValueBound(
+      ComponentValType(ComponentTypeCode::U32));
+
+  auto &InstSec =
+      std::get<AST::Component::InstanceSection>(Comp.getSections()[2]);
+  InstSec.getContent().emplace_back();
+  InstSec.getContent().back().setInstantiateArgs(0U, {makeValueArg("v", 0)});
+
+  Validator::Validator V(Conf);
+  EXPECT_TRUE(V.validate(Comp));
+}
+
+TEST(ComponentValidatorTest, InstantiationConsumesSameValueTwice) {
+  // Pass the same value to two instantiations -> the second use is a linearity
+  // violation (wasm-tools: "value 0 cannot be used more than once").
+  AST::Component::Component Comp;
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::ComponentSection>();
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::ImportSection>();
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::InstanceSection>();
+
+  addValuePassthroughChild(
+      std::get<AST::Component::ComponentSection>(Comp.getSections()[0]));
+
+  auto &ImpSec = std::get<AST::Component::ImportSection>(Comp.getSections()[1]);
+  ImpSec.getContent().emplace_back();
+  ImpSec.getContent().back().getName() = "val0";
+  ImpSec.getContent().back().getDesc().setValueBound(
+      ComponentValType(ComponentTypeCode::U32));
+
+  auto &InstSec =
+      std::get<AST::Component::InstanceSection>(Comp.getSections()[2]);
+  InstSec.getContent().emplace_back();
+  InstSec.getContent().back().setInstantiateArgs(0U, {makeValueArg("v", 0)});
+  InstSec.getContent().emplace_back();
+  InstSec.getContent().back().setInstantiateArgs(0U, {makeValueArg("v", 0)});
+
+  Validator::Validator V(Conf);
+  auto Res = V.validate(Comp);
+  EXPECT_FALSE(Res);
+  EXPECT_EQ(Res.error(), ErrCode::Value::ComponentValueAlreadyConsumed);
+}
+
+TEST(ComponentValidatorTest, ValueConsumedByInlineExport) {
+  // Bundle a value into an inline-export (bag-of-exports) instance -> the value
+  // is consumed (wasm-tools: valid; previously rejected).
+  AST::Component::Component Comp;
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::ImportSection>();
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::InstanceSection>();
+
+  auto &ImpSec = std::get<AST::Component::ImportSection>(Comp.getSections()[0]);
+  ImpSec.getContent().emplace_back();
+  ImpSec.getContent().back().getName() = "val0";
+  ImpSec.getContent().back().getDesc().setValueBound(
+      ComponentValType(ComponentTypeCode::U32));
+
+  AST::Component::InlineExport E;
+  E.getName() = "e";
+  E.getSortIdx().getSort().setIsCore(false);
+  E.getSortIdx().getSort().setSortType(AST::Component::Sort::SortType::Value);
+  E.getSortIdx().setIdx(0);
+  auto &InstSec =
+      std::get<AST::Component::InstanceSection>(Comp.getSections()[1]);
+  InstSec.getContent().emplace_back();
+  InstSec.getContent().back().setInlineExports({std::move(E)});
+
+  Validator::Validator V(Conf);
+  EXPECT_TRUE(V.validate(Comp));
+}
+
+TEST(ComponentValidatorTest, InlineExportConsumesSameValueTwice) {
+  // Bundle the same value into two inline exports -> linearity violation
+  // (wasm-tools: "value 0 cannot be used more than once").
+  AST::Component::Component Comp;
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::ImportSection>();
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::InstanceSection>();
+
+  auto &ImpSec = std::get<AST::Component::ImportSection>(Comp.getSections()[0]);
+  ImpSec.getContent().emplace_back();
+  ImpSec.getContent().back().getName() = "val0";
+  ImpSec.getContent().back().getDesc().setValueBound(
+      ComponentValType(ComponentTypeCode::U32));
+
+  AST::Component::InlineExport E0;
+  E0.getName() = "e0";
+  E0.getSortIdx().getSort().setIsCore(false);
+  E0.getSortIdx().getSort().setSortType(AST::Component::Sort::SortType::Value);
+  E0.getSortIdx().setIdx(0);
+  AST::Component::InlineExport E1;
+  E1.getName() = "e1";
+  E1.getSortIdx().getSort().setIsCore(false);
+  E1.getSortIdx().getSort().setSortType(AST::Component::Sort::SortType::Value);
+  E1.getSortIdx().setIdx(0);
+  auto &InstSec =
+      std::get<AST::Component::InstanceSection>(Comp.getSections()[1]);
+  InstSec.getContent().emplace_back();
+  InstSec.getContent().back().setInlineExports({std::move(E0), std::move(E1)});
+
+  Validator::Validator V(Conf);
+  auto Res = V.validate(Comp);
+  EXPECT_FALSE(Res);
+  EXPECT_EQ(Res.error(), ErrCode::Value::ComponentValueAlreadyConsumed);
+}
+
 } // namespace
