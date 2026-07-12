@@ -15,6 +15,14 @@ Expect<void> Loader::loadValue(AST::Component::Value &V) {
   EXPECTED_TRY(uint32_t Len, FMgr.readU32().map_error([this](auto E) {
     return logLoadError(E, FMgr.getLastOffset(), ASTNodeAttr::Comp_Sec_Value);
   }));
+  // Reject a length that overruns the remaining input before allocating the
+  // payload buffer, matching loadVecCnt / loadSectionContent. Without this an
+  // attacker-controlled `len` forces a multi-gigabyte allocation from a tiny
+  // file.
+  if (Len > FMgr.getRemainSize()) {
+    return logLoadError(ErrCode::Value::LengthOutOfBounds, FMgr.getLastOffset(),
+                        ASTNodeAttr::Comp_Sec_Value);
+  }
   EXPECTED_TRY(V.getData(), FMgr.readBytes(Len).map_error([this](auto E) {
     return logLoadError(E, FMgr.getLastOffset(), ASTNodeAttr::Comp_Sec_Value);
   }));

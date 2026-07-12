@@ -507,6 +507,27 @@ TEST(ComponentLoaderTest, ValueSection) {
   EXPECT_EQ(Sec.getContent()[0].getData()[0], 0x01);
 }
 
+TEST(ComponentLoaderTest, ValueSectionLengthOverrunRejected) {
+  WasmEdge::Configure Conf;
+  Conf.addProposal(WasmEdge::Proposal::Component);
+  WasmEdge::Loader::Loader Loader(Conf);
+
+  // Value section (size 7) whose value `len` field is 0xFFFFFFFF
+  // (LEB `ff ff ff ff 0f`) — larger than the remaining input. Must be rejected
+  // at load with LengthOutOfBounds instead of forcing a ~4 GB readBytes
+  // allocation.
+  //   0x0c = value section id (12), 0x07 = content size,
+  //   0x01 = vec count (1 value), 0x7f = bool valtype, len = 0xFFFFFFFF.
+  std::vector<uint8_t> Vec = {
+      0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00,       // preamble
+      0x0c, 0x07, 0x01, 0x7f, 0xff, 0xff, 0xff, 0xff, 0x0f, // value section
+  };
+
+  auto Res = Loader.parseWasmUnit(Vec);
+  ASSERT_FALSE(Res);
+  EXPECT_EQ(Res.error().getEnum(), WasmEdge::ErrCode::Value::LengthOutOfBounds);
+}
+
 TEST(ComponentLoaderTest, MalformedResultList) {
   WasmEdge::Configure Conf;
   Conf.addProposal(WasmEdge::Proposal::Component);
