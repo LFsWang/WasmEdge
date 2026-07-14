@@ -853,9 +853,11 @@ void SpecTest::processCommands(ContextHandle Ctx, std::string_view Proposal,
       EXPECT_TRUE(Res.error().getErrCodePhase() ==
                   WasmEdge::WasmPhase::Loading);
       if (IsComponent) {
-        if (!stringContains(Text, WasmEdge::ErrCodeStr[Res.error().getEnum()])) {
-          spdlog::info("   (component) load rejected with '{}', spec text '{}'"sv,
-                       WasmEdge::ErrCodeStr[Res.error().getEnum()], Text);
+        if (!stringContains(Text,
+                            WasmEdge::ErrCodeStr[Res.error().getEnum()])) {
+          spdlog::info(
+              "   (component) load rejected with '{}', spec text '{}'"sv,
+              WasmEdge::ErrCodeStr[Res.error().getEnum()], Text);
         }
       } else {
         EXPECT_TRUE(
@@ -882,7 +884,8 @@ void SpecTest::processCommands(ContextHandle Ctx, std::string_view Proposal,
       // message (and some same-binary cases assert two different fragments), so
       // it is only a non-fatal diagnostic here.
       if (IsComponent) {
-        if (!stringContains(Text, WasmEdge::ErrCodeStr[Res.error().getEnum()])) {
+        if (!stringContains(Text,
+                            WasmEdge::ErrCodeStr[Res.error().getEnum()])) {
           spdlog::info("   (component) rejected with '{}', spec text '{}'"sv,
                        WasmEdge::ErrCodeStr[Res.error().getEnum()], Text);
         }
