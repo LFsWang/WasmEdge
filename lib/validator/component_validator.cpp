@@ -798,11 +798,10 @@ std::vector<uint32_t> funcResourceIndices(const ComponentContext &Ctx,
 // Validate that an annotated function ([constructor]/[method]) has the shape
 // the annotation requires (Explainer.md naming rules). The annotated resource
 // must already be resolvable as a kebab label in this scope.
-Expect<void>
-validateAnnotatedFuncSig(const ComponentContext &Ctx,
-                         const ComponentName &CName,
-                         const AST::Component::FuncType &FT,
-                         bool IsExport) noexcept {
+Expect<void> validateAnnotatedFuncSig(const ComponentContext &Ctx,
+                                      const ComponentName &CName,
+                                      const AST::Component::FuncType &FT,
+                                      bool IsExport) noexcept {
   auto wantId = [&](std::string_view Label) -> std::optional<uint64_t> {
     if (auto Idx = Ctx.getResourceLabel(Label, IsExport)) {
       if (const auto *R = Ctx.getResource(*Idx)) {
@@ -1875,7 +1874,8 @@ Validator::validate(const AST::Component::CoreInstance &Inst) noexcept {
         }
         CompCtx.addCoreInstanceExport(InstanceIdx, ExportDesc.getExternalName(),
                                       ExportDesc.getExternalType(), MemTy,
-                                      /*Tab=*/nullptr, /*Glob=*/nullptr, FuncTy);
+                                      /*Tab=*/nullptr, /*Glob=*/nullptr,
+                                      FuncTy);
       }
     } else if (ModTy != nullptr && ModTy->isModuleType()) {
       for (const auto &Decl : ModTy->getModuleType()) {
@@ -3520,7 +3520,8 @@ Expect<void> Validator::validate(const AST::Component::Import &Im) noexcept {
   //   2. propagate:  mark resources introduced here (importable / provenance).
   //   3. name:       parse the import name per the import-name grammar.
   //   4. dup:        reject duplicate import names (strongly-unique).
-  //   5. annotated:  enforce the annotated-name constraints (checkAnnotatedName).
+  //   5. annotated:  enforce the annotated-name constraints
+  //   (checkAnnotatedName).
   //   6. resource:   an imported func may only reference importable resources.
   //   7. label:      register a TypeBound resource's kebab label for later
   //                  annotated imports in this scope.
@@ -3797,7 +3798,8 @@ Expect<void> Validator::validate(const AST::Component::Export &Ex) noexcept {
   if (!Sort.isCore()) {
     const bool IsFunc =
         Sort.getSortType() == AST::Component::Sort::SortType::Func;
-    const AST::Component::FuncType *FT = IsFunc ? CompCtx.getFunc(Idx) : nullptr;
+    const AST::Component::FuncType *FT =
+        IsFunc ? CompCtx.getFunc(Idx) : nullptr;
     // Binary.md "annotated names": annotated plainnames only on func exports;
     // the named resource must be a preceding resource export in this scope;
     // constructor/method signatures have the required shape.
@@ -3826,7 +3828,8 @@ Expect<void> Validator::validate(const AST::Component::Export &Ex) noexcept {
     }
     EXPECTED_TRY(checkExportResourceNameable(CompCtx, ExpResources)
                      .map_error([](auto E) {
-                       spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Export));
+                       spdlog::error(
+                           ErrInfo::InfoAST(ASTNodeAttr::Comp_Export));
                        return E;
                      }));
   }
@@ -4112,11 +4115,12 @@ Validator::validate(const AST::Component::ImportDecl &Decl) noexcept {
 
 Expect<void>
 Validator::validate(const AST::Component::ExportDecl &Decl) noexcept {
-  // Same logical steps as Import/Export/ImportDecl (name, dup, bounds/propagate,
-  // annotated, resource, label), with one deliberate exception the export paths
-  // share: the name grammar + uniqueness are checked BEFORE the externdesc so a
-  // duplicate or malformed name doesn't widen the scope's sort counts. The
-  // annotated -> resource tail matches the concrete Export path.
+  // Same logical steps as Import/Export/ImportDecl (name, dup,
+  // bounds/propagate, annotated, resource, label), with one deliberate
+  // exception the export paths share: the name grammar + uniqueness are checked
+  // BEFORE the externdesc so a duplicate or malformed name doesn't widen the
+  // scope's sort counts. The annotated -> resource tail matches the concrete
+  // Export path.
   EXPECTED_TRY(ComponentName CName,
                validateExportName(Decl.getName()).map_error([](auto E) {
                  spdlog::error(ErrInfo::InfoAST(ASTNodeAttr::Comp_Decl_Export));
@@ -4179,9 +4183,9 @@ Validator::validate(const AST::Component::ExportDecl &Decl) noexcept {
         checkAnnotatedName(CompCtx, CName, IsFunc, FT, /*IsExport=*/true)
             .map_error(ReportError));
     if (FT != nullptr) {
-      EXPECTED_TRY(
-          checkExportResourceNameable(CompCtx, funcResourceIndices(CompCtx, *FT))
-              .map_error(ReportError));
+      EXPECTED_TRY(checkExportResourceNameable(
+                       CompCtx, funcResourceIndices(CompCtx, *FT))
+                       .map_error(ReportError));
     }
   }
 

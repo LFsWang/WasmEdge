@@ -708,7 +708,8 @@ TEST(ComponentValidatorTest, InstanceTypeExportConstructorPlainAllowed) {
   ASSERT_TRUE(V.validate(Comp));
 }
 
-TEST(ComponentValidatorTest, InstanceTypeExportAnnotatedNameMissingResourceRejected) {
+TEST(ComponentValidatorTest,
+     InstanceTypeExportAnnotatedNameMissingResourceRejected) {
   // (type (instance
   //   (export "s" (type (sub resource)))         ;; type 0: resource s
   //   (type (func (param "self" (borrow 0))))    ;; type 1: valid method sig
@@ -3054,7 +3055,8 @@ TEST(ComponentValidatorTest, FuncImportStreamOwnImportedResourceAccepted) {
   Comp.getSections().back().emplace<AST::Component::ImportSection>();
 
   // type 0: imported resource.
-  auto &ImpSec0 = std::get<AST::Component::ImportSection>(Comp.getSections()[0]);
+  auto &ImpSec0 =
+      std::get<AST::Component::ImportSection>(Comp.getSections()[0]);
   ImpSec0.getContent().emplace_back();
   ImpSec0.getContent().back().getName() = "r";
   ImpSec0.getContent().back().getDesc().setTypeBound();
@@ -3077,7 +3079,8 @@ TEST(ComponentValidatorTest, FuncImportStreamOwnImportedResourceAccepted) {
     TypeSec.getContent().back().setFuncType(std::move(FT));
   }
 
-  auto &ImpSec1 = std::get<AST::Component::ImportSection>(Comp.getSections()[2]);
+  auto &ImpSec1 =
+      std::get<AST::Component::ImportSection>(Comp.getSections()[2]);
   ImpSec1.getContent().emplace_back();
   ImpSec1.getContent().back().getName() = "f";
   ImpSec1.getContent().back().getDesc().setFuncTypeIdx(2);
