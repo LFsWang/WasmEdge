@@ -770,6 +770,14 @@ void collectDefValTypeResources(const ComponentContext &Ctx,
         collectValTypeResources(Ctx, *C.second, Out, Depth + 1);
       }
     }
+  } else if (D.isStreamTy()) {
+    if (D.getStream().ValTy.has_value()) {
+      collectValTypeResources(Ctx, *D.getStream().ValTy, Out, Depth + 1);
+    }
+  } else if (D.isFutureTy()) {
+    if (D.getFuture().ValTy.has_value()) {
+      collectValTypeResources(Ctx, *D.getFuture().ValTy, Out, Depth + 1);
+    }
   }
 }
 

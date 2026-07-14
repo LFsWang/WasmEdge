@@ -776,6 +776,12 @@ private:
           return true;
         }
       }
+    } else if (D.isStreamTy()) {
+      return D.getStream().ValTy.has_value() &&
+             valTypeRefsResource(O, *D.getStream().ValTy, Depth);
+    } else if (D.isFutureTy()) {
+      return D.getFuture().ValTy.has_value() &&
+             valTypeRefsResource(O, *D.getFuture().ValTy, Depth);
     }
     return false;
   }

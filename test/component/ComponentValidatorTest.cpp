@@ -2995,4 +2995,130 @@ TEST(ComponentValidatorTest, InlineExportConsumesSameValueTwice) {
   EXPECT_EQ(Res.error(), ErrCode::Value::ComponentValueAlreadyConsumed);
 }
 
+// =============================================================================
+// Resource escaping through stream<T> / future<T> (S1). The resource walk must
+// descend into a stream/future payload just like record/list/etc., so an
+// (own $R) hidden inside a stream/future is still subject to the importability
+// and export-nameability rules.
+// =============================================================================
+
+TEST(ComponentValidatorTest, FuncImportStreamOwnLocalResourceRejected) {
+  // An imported func whose param is (stream (own $localR)) references a
+  // locally-defined (non-importable) resource -> reject (importability). Before
+  // the stream arm was added to the resource walk this wrongly validated.
+  AST::Component::Component Comp;
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::TypeSection>();
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::ImportSection>();
+
+  auto &TypeSec = std::get<AST::Component::TypeSection>(Comp.getSections()[0]);
+  // type 0: local resource.
+  TypeSec.getContent().emplace_back();
+  TypeSec.getContent().back().setResourceType(AST::Component::ResourceType());
+  // type 1: (stream (own 0)).
+  TypeSec.getContent().emplace_back();
+  {
+    AST::Component::DefValType DVT;
+    DVT.setStream(
+        AST::Component::StreamTy{ComponentValType(ComponentTypeCode::Own, 0)});
+    TypeSec.getContent().back().setDefValType(std::move(DVT));
+  }
+  // type 2: (func (param "x" (stream (own 0)))).
+  TypeSec.getContent().emplace_back();
+  {
+    AST::Component::FuncType FT;
+    FT.setParamList({AST::Component::LabelValType(
+        "x"s, ComponentValType(ComponentTypeCode::TypeIndex, 1))});
+    TypeSec.getContent().back().setFuncType(std::move(FT));
+  }
+
+  auto &ImpSec = std::get<AST::Component::ImportSection>(Comp.getSections()[1]);
+  ImpSec.getContent().emplace_back();
+  ImpSec.getContent().back().getName() = "f";
+  ImpSec.getContent().back().getDesc().setFuncTypeIdx(2);
+
+  Validator::Validator V(Conf);
+  EXPECT_FALSE(V.validate(Comp));
+}
+
+TEST(ComponentValidatorTest, FuncImportStreamOwnImportedResourceAccepted) {
+  // Same shape but the resource is imported (importable) -> accept. Guards the
+  // stream-walk fix against over-rejecting a legitimate (stream (own $R)).
+  AST::Component::Component Comp;
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::ImportSection>();
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::TypeSection>();
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::ImportSection>();
+
+  // type 0: imported resource.
+  auto &ImpSec0 = std::get<AST::Component::ImportSection>(Comp.getSections()[0]);
+  ImpSec0.getContent().emplace_back();
+  ImpSec0.getContent().back().getName() = "r";
+  ImpSec0.getContent().back().getDesc().setTypeBound();
+
+  auto &TypeSec = std::get<AST::Component::TypeSection>(Comp.getSections()[1]);
+  // type 1: (stream (own 0)).
+  TypeSec.getContent().emplace_back();
+  {
+    AST::Component::DefValType DVT;
+    DVT.setStream(
+        AST::Component::StreamTy{ComponentValType(ComponentTypeCode::Own, 0)});
+    TypeSec.getContent().back().setDefValType(std::move(DVT));
+  }
+  // type 2: (func (param "x" (stream (own 0)))).
+  TypeSec.getContent().emplace_back();
+  {
+    AST::Component::FuncType FT;
+    FT.setParamList({AST::Component::LabelValType(
+        "x"s, ComponentValType(ComponentTypeCode::TypeIndex, 1))});
+    TypeSec.getContent().back().setFuncType(std::move(FT));
+  }
+
+  auto &ImpSec1 = std::get<AST::Component::ImportSection>(Comp.getSections()[2]);
+  ImpSec1.getContent().emplace_back();
+  ImpSec1.getContent().back().getName() = "f";
+  ImpSec1.getContent().back().getDesc().setFuncTypeIdx(2);
+
+  Validator::Validator V(Conf);
+  EXPECT_TRUE(V.validate(Comp));
+}
+
+TEST(ComponentValidatorTest, TypeExportFutureOwnUnexportedResourceRejected) {
+  // Exporting a (future (own $localR)) type whose resource is neither imported
+  // nor exported violates export resource-avoidance (Binary.md:404-405). The
+  // future arm of the resource walk must surface the hidden resource.
+  AST::Component::Component Comp;
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::TypeSection>();
+  Comp.getSections().emplace_back();
+  Comp.getSections().back().emplace<AST::Component::ExportSection>();
+
+  auto &TypeSec = std::get<AST::Component::TypeSection>(Comp.getSections()[0]);
+  // type 0: local resource (not exported).
+  TypeSec.getContent().emplace_back();
+  TypeSec.getContent().back().setResourceType(AST::Component::ResourceType());
+  // type 1: (future (own 0)).
+  TypeSec.getContent().emplace_back();
+  {
+    AST::Component::DefValType DVT;
+    DVT.setFuture(
+        AST::Component::FutureTy{ComponentValType(ComponentTypeCode::Own, 0)});
+    TypeSec.getContent().back().setDefValType(std::move(DVT));
+  }
+
+  auto &ExpSec = std::get<AST::Component::ExportSection>(Comp.getSections()[1]);
+  ExpSec.getContent().emplace_back();
+  ExpSec.getContent().back().getName() = "t";
+  ExpSec.getContent().back().getSortIndex().getSort().setIsCore(false);
+  ExpSec.getContent().back().getSortIndex().getSort().setSortType(
+      AST::Component::Sort::SortType::Type);
+  ExpSec.getContent().back().getSortIndex().setIdx(1);
+
+  Validator::Validator V(Conf);
+  EXPECT_FALSE(V.validate(Comp));
+}
+
 } // namespace
